@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 pub struct ArigConfig {
@@ -25,6 +26,20 @@ pub struct ServiceConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    pub ready: Option<ReadyProbe>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReadyProbe {
+    /// TCP host:port to connect to. Probe passes when connect() succeeds.
+    pub tcp: Option<String>,
+    /// Total time to keep retrying before giving up. e.g. "30s", "1m 30s".
+    #[serde(default = "default_probe_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+fn default_probe_timeout() -> Duration {
+    Duration::from_secs(60)
 }
 
 impl ArigConfig {

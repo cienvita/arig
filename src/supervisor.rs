@@ -1,16 +1,19 @@
-use crate::config::{ArigConfig, ServiceConfig, ServiceType};
+use crate::config::{ArigConfig, ReadyProbe, ServiceConfig, ServiceType};
 use crate::dag;
 use futures::future::select_all;
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::signal;
 
 const TAIL_LINES: usize = 50;
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 type LogTail = Arc<Mutex<VecDeque<String>>>;
 
@@ -30,6 +33,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
     for wave in &waves {
         let mut wave_oneshots: Vec<ManagedChild> = Vec::new();
+        let mut wave_probes: Vec<(String, ReadyProbe)> = Vec::new();
 
         for name in wave {
             let service = &config.services[name];
@@ -47,6 +51,9 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             if service.service_type == ServiceType::Oneshot {
                 wave_oneshots.push(managed);
             } else {
+                if let Some(probe) = &service.ready {
+                    wave_probes.push((name.clone(), probe.clone()));
+                }
                 children.push(managed);
             }
         }
@@ -62,6 +69,20 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
                 anyhow::bail!("oneshot '{}' failed", managed.name);
             }
             eprintln!("arig: oneshot '{}' completed", managed.name);
+        }
+
+        // Block on readiness probes for long-running services in this wave
+        for (name, probe) in wave_probes {
+            if let Err(err) = wait_ready(&name, &probe).await {
+                eprintln!("arig: {err}");
+                if let Some(idx) = children.iter().position(|c| c.name == name) {
+                    drain_io(&mut children[idx].io_tasks).await;
+                    let n = children[idx].name.clone();
+                    dump_tail(&n, &children[idx].tail);
+                }
+                shutdown(&mut children, None).await;
+                anyhow::bail!("readiness probe failed for '{name}'");
+            }
         }
     }
 
@@ -189,6 +210,43 @@ fn dump_tail(name: &str, tail: &LogTail) {
         eprintln!("[{name}] {line}");
     }
     eprintln!("arig: --- end '{name}' tail ---");
+}
+
+async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
+    let Some(tcp_addr) = probe.tcp.as_deref() else {
+        return Ok(());
+    };
+
+    eprintln!(
+        "arig: waiting for '{name}' tcp probe on {tcp_addr} (timeout {})",
+        humantime::format_duration(probe.timeout),
+    );
+
+    let deadline = Instant::now() + probe.timeout;
+    loop {
+        let last_err: String = match tokio::time::timeout(
+            PROBE_CONNECT_TIMEOUT,
+            TcpStream::connect(tcp_addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                eprintln!("arig: '{name}' is ready");
+                return Ok(());
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "connect timed out".into(),
+        };
+
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "'{name}' tcp probe '{tcp_addr}' did not become ready within {}: last error: {last_err}",
+                humantime::format_duration(probe.timeout),
+            );
+        }
+
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
 }
 
 fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::process::Child> {
