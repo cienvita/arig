@@ -31,7 +31,7 @@ Reads `arig.yaml` in the current directory. Example:
 ## Todo
 
 Near-term:
-- [ ] `-C dir` flag (chdir before reading config)
+- [x] `-C dir` flag (chdir before reading config)
 - [ ] Resolve `working_dir` and template paths against the yaml file's directory
 - [ ] HTTP/TCP health checks with readiness gating
 - [ ] Template rendering for `.arig/templates` -> `.arig/generated`
