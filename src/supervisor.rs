@@ -1,7 +1,11 @@
 use crate::config::{ArigConfig, ReadyProbe, ServiceConfig, ServiceType};
 use crate::dag;
+use chrono::Local;
 use futures::future::select_all;
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +20,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 type LogTail = Arc<Mutex<VecDeque<String>>>;
+type LogSink = Arc<Mutex<File>>;
 
 struct ManagedChild {
     name: String,
@@ -45,6 +50,9 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         });
     }
 
+    let session_dir = create_session_dir()?;
+    eprintln!("arig: logs at {}", session_dir.display());
+
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
 
@@ -56,7 +64,8 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let service = &config.services[name];
             let mut child = spawn_service(name, service)?;
             let tail: LogTail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LINES)));
-            let io_tasks = pipe_output(&mut child, name, &tail);
+            let log_file = open_log_file(&session_dir, name)?;
+            let io_tasks = pipe_output(&mut child, name, &tail, &log_file);
 
             let managed = ManagedChild {
                 name: name.clone(),
@@ -195,15 +204,18 @@ fn pipe_output(
     managed: &mut tokio::process::Child,
     name: &str,
     tail: &LogTail,
+    log_file: &LogSink,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut tasks = Vec::new();
     if let Some(stdout) = managed.stdout.take() {
         let n = name.to_string();
         let t = tail.clone();
+        let f = log_file.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 println!("[{n}] {line}");
+                write_log_line(&f, &line);
                 push_tail(&t, line);
             }
         }));
@@ -211,15 +223,61 @@ fn pipe_output(
     if let Some(stderr) = managed.stderr.take() {
         let n = name.to_string();
         let t = tail.clone();
+        let f = log_file.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("[{n}] {line}");
+                write_log_line(&f, &line);
                 push_tail(&t, line);
             }
         }));
     }
     tasks
+}
+
+fn write_log_line(file: &LogSink, line: &str) {
+    if let Ok(mut f) = file.lock() {
+        let _ = writeln!(*f, "{line}");
+    }
+}
+
+fn create_session_dir() -> anyhow::Result<PathBuf> {
+    let stamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let dir = PathBuf::from(".logs").join(&stamp);
+    std::fs::create_dir_all(&dir)?;
+
+    // Best-effort `.logs/latest` pointer to the freshest run. On Windows this
+    // needs Developer Mode (or admin) to create a symlink; on failure we just
+    // skip silently — the timestamped dir is the source of truth.
+    let latest = PathBuf::from(".logs").join("latest");
+    let _ = std::fs::remove_file(&latest);
+    let _ = std::fs::remove_dir(&latest);
+    let _ = create_dir_link(&dir, &latest);
+
+    Ok(dir)
+}
+
+#[cfg(windows)]
+fn create_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    // Use a relative target so the link survives if .logs/ is moved.
+    let rel = target.file_name().map(PathBuf::from).unwrap_or_else(|| target.to_path_buf());
+    std::os::windows::fs::symlink_dir(rel, link)
+}
+
+#[cfg(unix)]
+fn create_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    let rel = target.file_name().map(PathBuf::from).unwrap_or_else(|| target.to_path_buf());
+    std::os::unix::fs::symlink(rel, link)
+}
+
+fn open_log_file(session_dir: &Path, name: &str) -> anyhow::Result<LogSink> {
+    let path = session_dir.join(format!("{name}.log"));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    Ok(Arc::new(Mutex::new(file)))
 }
 
 fn push_tail(tail: &LogTail, line: String) {
