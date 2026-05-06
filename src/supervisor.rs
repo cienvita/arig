@@ -29,6 +29,22 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     #[cfg(windows)]
     let _job = win::JobGuard::new()?;
 
+    // Install the ctrl-c handler eagerly. tokio::signal::ctrl_c registers its
+    // OS handler on first poll, so deferring it until the post-wave select
+    // means a ctrl-c during spawn / probe / oneshot waits hits the Windows
+    // default handler and kills us with STATUS_CONTROL_C_EXIT before we can
+    // run shutdown(). Broadcasting via watch lets every blocking await race
+    // against shutdown without re-arming a fresh signal future each time
+    // (which would lose any signal that fired between selects).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            let _ = tx.send(true);
+        });
+    }
+
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
 
@@ -62,7 +78,17 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
         // Wait for all oneshots in this wave to finish before next wave
         for mut managed in wave_oneshots {
-            let status = managed.child.wait().await?;
+            let mut rx = shutdown_rx.clone();
+            let status = tokio::select! {
+                s = managed.child.wait() => s?,
+                _ = rx.changed() => {
+                    eprintln!("\narig: shutting down...");
+                    shutdown(&mut children, None).await;
+                    eprintln!("arig: all services stopped.");
+                    return Ok(());
+                }
+            };
+
             if !status.success() {
                 eprintln!("arig: oneshot '{}' failed ({status})", managed.name);
                 drain_io(&mut managed.io_tasks).await;
@@ -75,7 +101,18 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
         // Block on readiness probes for long-running services in this wave
         for (name, probe) in wave_probes {
-            if let Err(err) = wait_ready(&name, &probe).await {
+            let mut rx = shutdown_rx.clone();
+            let result = tokio::select! {
+                r = wait_ready(&name, &probe) => r,
+                _ = rx.changed() => {
+                    eprintln!("\narig: shutting down...");
+                    shutdown(&mut children, None).await;
+                    eprintln!("arig: all services stopped.");
+                    return Ok(());
+                }
+            };
+
+            if let Err(err) = result {
                 eprintln!("arig: {err}");
                 if let Some(idx) = children.iter().position(|c| c.name == name) {
                     drain_io(&mut children[idx].io_tasks).await;
@@ -98,6 +135,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         children.len()
     );
 
+    let mut rx = shutdown_rx.clone();
     let exit = {
         let waits: Vec<_> = children
             .iter_mut()
@@ -111,7 +149,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             .collect();
 
         tokio::select! {
-            _ = signal::ctrl_c() => None,
+            _ = rx.changed() => None,
             ((idx, status), _, _) = select_all(waits) => Some((idx, status)),
         }
     };
