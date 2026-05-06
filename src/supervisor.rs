@@ -1,13 +1,24 @@
 use crate::config::{ArigConfig, ServiceConfig, ServiceType};
 use crate::dag;
+use futures::future::select_all;
+use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::signal;
 
+const TAIL_LINES: usize = 50;
+const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+type LogTail = Arc<Mutex<VecDeque<String>>>;
+
 struct ManagedChild {
     name: String,
     child: tokio::process::Child,
+    tail: LogTail,
+    io_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
@@ -16,7 +27,6 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
-    let mut io_tasks = Vec::new();
 
     for wave in &waves {
         let mut wave_oneshots: Vec<ManagedChild> = Vec::new();
@@ -24,18 +34,20 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         for name in wave {
             let service = &config.services[name];
             let mut child = spawn_service(name, service)?;
-            pipe_output(&mut child, name, &mut io_tasks);
+            let tail: LogTail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LINES)));
+            let io_tasks = pipe_output(&mut child, name, &tail);
+
+            let managed = ManagedChild {
+                name: name.clone(),
+                child,
+                tail,
+                io_tasks,
+            };
 
             if service.service_type == ServiceType::Oneshot {
-                wave_oneshots.push(ManagedChild {
-                    name: name.clone(),
-                    child,
-                });
+                wave_oneshots.push(managed);
             } else {
-                children.push(ManagedChild {
-                    name: name.clone(),
-                    child,
-                });
+                children.push(managed);
             }
         }
 
@@ -44,7 +56,9 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let status = managed.child.wait().await?;
             if !status.success() {
                 eprintln!("arig: oneshot '{}' failed ({status})", managed.name);
-                shutdown(&mut children).await;
+                drain_io(&mut managed.io_tasks).await;
+                dump_tail(&managed.name, &managed.tail);
+                shutdown(&mut children, None).await;
                 anyhow::bail!("oneshot '{}' failed", managed.name);
             }
             eprintln!("arig: oneshot '{}' completed", managed.name);
@@ -61,42 +75,120 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         children.len()
     );
 
-    signal::ctrl_c().await?;
-    eprintln!("\narig: shutting down...");
+    let exit = {
+        let waits: Vec<_> = children
+            .iter_mut()
+            .enumerate()
+            .map(|(i, c)| {
+                Box::pin(async move {
+                    let status = c.child.wait().await;
+                    (i, status)
+                })
+            })
+            .collect();
 
-    shutdown(&mut children).await;
+        tokio::select! {
+            _ = signal::ctrl_c() => None,
+            ((idx, status), _, _) = select_all(waits) => Some((idx, status)),
+        }
+    };
 
-    for task in io_tasks {
-        let _ = task.await;
+    let skip_idx = exit.as_ref().map(|(idx, _)| *idx);
+    let bail = match exit {
+        None => {
+            eprintln!("\narig: shutting down...");
+            false
+        }
+        Some((idx, Ok(status))) => {
+            eprintln!(
+                "arig: service '{}' exited (status {status}); long-running services aren't expected to exit, shutting down the rest",
+                children[idx].name
+            );
+            drain_io(&mut children[idx].io_tasks).await;
+            let name = children[idx].name.clone();
+            dump_tail(&name, &children[idx].tail);
+            true
+        }
+        Some((idx, Err(err))) => {
+            eprintln!(
+                "arig: service '{}' wait failed ({err}); shutting down the rest",
+                children[idx].name
+            );
+            drain_io(&mut children[idx].io_tasks).await;
+            let name = children[idx].name.clone();
+            dump_tail(&name, &children[idx].tail);
+            true
+        }
+    };
+
+    shutdown(&mut children, skip_idx).await;
+
+    for managed in children.iter_mut() {
+        drain_io(&mut managed.io_tasks).await;
     }
 
     eprintln!("arig: all services stopped.");
+    if bail {
+        anyhow::bail!("a service exited unexpectedly");
+    }
     Ok(())
 }
 
 fn pipe_output(
     managed: &mut tokio::process::Child,
     name: &str,
-    io_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-) {
+    tail: &LogTail,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
     if let Some(stdout) = managed.stdout.take() {
         let n = name.to_string();
-        io_tasks.push(tokio::spawn(async move {
+        let t = tail.clone();
+        tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 println!("[{n}] {line}");
+                push_tail(&t, line);
             }
         }));
     }
     if let Some(stderr) = managed.stderr.take() {
         let n = name.to_string();
-        io_tasks.push(tokio::spawn(async move {
+        let t = tail.clone();
+        tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("[{n}] {line}");
+                push_tail(&t, line);
             }
         }));
     }
+    tasks
+}
+
+fn push_tail(tail: &LogTail, line: String) {
+    let mut q = tail.lock().expect("tail mutex poisoned");
+    if q.len() >= TAIL_LINES {
+        q.pop_front();
+    }
+    q.push_back(line);
+}
+
+async fn drain_io(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for t in tasks.drain(..) {
+        let _ = tokio::time::timeout(IO_DRAIN_TIMEOUT, t).await;
+    }
+}
+
+fn dump_tail(name: &str, tail: &LogTail) {
+    let q = tail.lock().expect("tail mutex poisoned");
+    if q.is_empty() {
+        return;
+    }
+    eprintln!("arig: --- last {} line(s) from '{}' ---", q.len(), name);
+    for line in q.iter() {
+        eprintln!("[{name}] {line}");
+    }
+    eprintln!("arig: --- end '{name}' tail ---");
 }
 
 fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::process::Child> {
@@ -122,17 +214,24 @@ fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::p
     Ok(child)
 }
 
-async fn shutdown(children: &mut [ManagedChild]) {
+async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
     #[cfg(windows)]
     win::send_ctrl_c();
 
     #[cfg(unix)]
-    for managed in children.iter() {
+    for (i, managed) in children.iter().enumerate() {
+        if Some(i) == skip_idx {
+            continue;
+        }
         unix::send_sigterm(&managed.child);
     }
 
     // Wait up to 5 seconds per process for graceful exit, then force kill
-    for managed in children.iter_mut() {
+    for (i, managed) in children.iter_mut().enumerate() {
+        if Some(i) == skip_idx {
+            continue;
+        }
+
         let graceful = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             managed.child.wait(),
@@ -141,10 +240,10 @@ async fn shutdown(children: &mut [ManagedChild]) {
 
         match graceful {
             Ok(Ok(status)) => {
-                eprintln!("arig: {} exited gracefully ({status})", managed.name);
+                eprintln!("arig: {} stopped ({status})", managed.name);
             }
             _ => {
-                eprintln!("arig: force killing {}", managed.name);
+                eprintln!("arig: {} did not stop in time, force killing", managed.name);
                 let _ = managed.child.kill().await;
             }
         }
