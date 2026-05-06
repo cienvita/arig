@@ -19,6 +19,7 @@ type LogTail = Arc<Mutex<VecDeque<String>>>;
 
 struct ManagedChild {
     name: String,
+    wave: usize,
     child: tokio::process::Child,
     tail: LogTail,
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -31,7 +32,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
 
-    for wave in &waves {
+    for (wave_idx, wave) in waves.iter().enumerate() {
         let mut wave_oneshots: Vec<ManagedChild> = Vec::new();
         let mut wave_probes: Vec<(String, ReadyProbe)> = Vec::new();
 
@@ -43,6 +44,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
             let managed = ManagedChild {
                 name: name.clone(),
+                wave: wave_idx,
                 child,
                 tail,
                 io_tasks,
@@ -143,10 +145,6 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     };
 
     shutdown(&mut children, skip_idx).await;
-
-    for managed in children.iter_mut() {
-        drain_io(&mut managed.io_tasks).await;
-    }
 
     eprintln!("arig: all services stopped.");
     if bail {
@@ -273,42 +271,58 @@ fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::p
 }
 
 async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
+    // Walk waves in reverse: dependents first, then their dependencies. Within
+    // each wave, signal everyone, then wait for the whole wave to settle before
+    // moving on. This stops api logging "nats disconnected" while we're still
+    // taking nats down.
+    let max_wave = children.iter().map(|c| c.wave).max().unwrap_or(0);
+
+    for wave_idx in (0..=max_wave).rev() {
+        let wave_indices: Vec<usize> = (0..children.len())
+            .filter(|i| children[*i].wave == wave_idx && Some(*i) != skip_idx)
+            .collect();
+
+        if wave_indices.is_empty() {
+            continue;
+        }
+
+        for &i in &wave_indices {
+            send_shutdown_signal(&children[i].child);
+        }
+
+        for &i in &wave_indices {
+            let managed = &mut children[i];
+            let graceful = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                managed.child.wait(),
+            )
+            .await;
+
+            match graceful {
+                Ok(Ok(status)) => {
+                    eprintln!("arig: {} stopped ({status})", managed.name);
+                }
+                _ => {
+                    eprintln!("arig: {} did not stop in time, force killing", managed.name);
+                    let _ = managed.child.kill().await;
+                }
+            }
+
+            drain_io(&mut managed.io_tasks).await;
+        }
+    }
+}
+
+fn send_shutdown_signal(child: &tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+
     #[cfg(windows)]
-    win::send_ctrl_c();
+    win::send_ctrl_break(pid);
 
     #[cfg(unix)]
-    for (i, managed) in children.iter().enumerate() {
-        if Some(i) == skip_idx {
-            continue;
-        }
-        unix::send_sigterm(&managed.child);
-    }
-
-    // Wait up to 5 seconds per process for graceful exit, then force kill
-    for (i, managed) in children.iter_mut().enumerate() {
-        if Some(i) == skip_idx {
-            continue;
-        }
-
-        let graceful = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            managed.child.wait(),
-        )
-        .await;
-
-        match graceful {
-            Ok(Ok(status)) => {
-                eprintln!("arig: {} stopped ({status})", managed.name);
-            }
-            _ => {
-                eprintln!("arig: {} did not stop in time, force killing", managed.name);
-                let _ = managed.child.kill().await;
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    win::restore_ctrl_c();
+    unix::send_sigterm(pid);
 }
 
 fn shell_program() -> &'static str {
@@ -333,15 +347,13 @@ fn shell_args(command: &str) -> Vec<&str> {
 #[cfg(windows)]
 mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Console::{
-        GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_C_EVENT,
-    };
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, CREATE_NEW_PROCESS_GROUP};
 
     /// RAII guard that holds the job object handle. Children assigned to this
     /// job are killed when the handle is closed (including on parent crash).
@@ -386,25 +398,22 @@ mod win {
         }
     }
 
-    pub fn configure_child(_cmd: &mut tokio::process::Command) {
-        // Children inherit the job object from the parent process.
-        // No extra flags needed since we assigned the parent to the job.
+    pub fn configure_child(cmd: &mut tokio::process::Command) {
+        // Children inherit the parent's job object (kill-on-close safety net).
+        // CREATE_NEW_PROCESS_GROUP makes each child the leader of its own
+        // group, so we can target it individually with GenerateConsoleCtrlEvent.
+        // It also detaches the child from the parent's Ctrl+C — we drive
+        // shutdown explicitly via send_ctrl_break.
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    /// Ignore Ctrl+C in our process, then broadcast CTRL_C_EVENT to the
-    /// console process group (which includes our children).
-    pub fn send_ctrl_c() {
+    /// Send CTRL_BREAK_EVENT to a single child's process group.
+    /// CTRL_C_EVENT cannot be addressed to a non-zero group on Windows;
+    /// CTRL_BREAK_EVENT can, and shutdown handlers in .NET / NATS / docker-CLI
+    /// treat it equivalently.
+    pub fn send_ctrl_break(pid: u32) {
         unsafe {
-            // Ignore Ctrl+C in parent while we send it to children
-            SetConsoleCtrlHandler(None, 1); // TRUE = add ignore
-            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-        }
-    }
-
-    /// Re-enable default Ctrl+C handling.
-    pub fn restore_ctrl_c() {
-        unsafe {
-            SetConsoleCtrlHandler(None, 0); // FALSE = remove ignore
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
         }
     }
 }
@@ -426,12 +435,10 @@ mod unix {
         }
     }
 
-    pub fn send_sigterm(child: &tokio::process::Child) {
-        if let Some(pid) = child.id() {
-            unsafe {
-                // Signal the whole process group
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
+    pub fn send_sigterm(pid: u32) {
+        unsafe {
+            // Signal the whole process group
+            libc::kill(-(pid as i32), libc::SIGTERM);
         }
     }
 }
