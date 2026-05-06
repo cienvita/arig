@@ -28,6 +28,24 @@ Reads `arig.yaml` in the current directory. Example:
         working_dir: ./api
         depends_on: [migrate]
 
+## Todo
+
+Near-term:
+- [ ] HTTP/TCP health checks with readiness gating
+- [ ] Template rendering for `.arig/templates` -> `.arig/generated`
+- [ ] Dynamic env injection from dependency metadata
+
+Command surface:
+- [ ] Implement `arig down`
+- [ ] `--format json` structured output
+- [ ] Single-service commands (`status`, `logs`, `env`, `restart`, `build`)
+
+Plugin platform:
+- [ ] Docker runtime via bollard
+- [ ] Helm/k8s publish plugins
+- [ ] External plugin protocol
+- [ ] `arig mcp` server
+
 ## License
 
 Dual-licensed under either of MIT or Apache-2.0, at your option.
