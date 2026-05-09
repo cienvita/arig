@@ -261,22 +261,25 @@ fn create_session_dir() -> anyhow::Result<PathBuf> {
 #[cfg(windows)]
 fn create_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
     // Use a relative target so the link survives if .logs/ is moved.
-    let rel = target.file_name().map(PathBuf::from).unwrap_or_else(|| target.to_path_buf());
+    let rel = target
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target.to_path_buf());
     std::os::windows::fs::symlink_dir(rel, link)
 }
 
 #[cfg(unix)]
 fn create_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
-    let rel = target.file_name().map(PathBuf::from).unwrap_or_else(|| target.to_path_buf());
+    let rel = target
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target.to_path_buf());
     std::os::unix::fs::symlink(rel, link)
 }
 
 fn open_log_file(session_dir: &Path, name: &str) -> anyhow::Result<LogSink> {
     let path = session_dir.join(format!("{name}.log"));
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
     Ok(Arc::new(Mutex::new(file)))
 }
 
@@ -318,19 +321,15 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
 
     let deadline = Instant::now() + probe.timeout;
     loop {
-        let last_err: String = match tokio::time::timeout(
-            PROBE_CONNECT_TIMEOUT,
-            TcpStream::connect(tcp_addr),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                eprintln!("arig: '{name}' is ready");
-                return Ok(());
-            }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "connect timed out".into(),
-        };
+        let last_err: String =
+            match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(tcp_addr)).await {
+                Ok(Ok(_)) => {
+                    eprintln!("arig: '{name}' is ready");
+                    return Ok(());
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "connect timed out".into(),
+            };
 
         if Instant::now() >= deadline {
             anyhow::bail!(
@@ -388,11 +387,8 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
 
         for &i in &wave_indices {
             let managed = &mut children[i];
-            let graceful = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                managed.child.wait(),
-            )
-            .await;
+            let graceful =
+                tokio::time::timeout(std::time::Duration::from_secs(5), managed.child.wait()).await;
 
             match graceful {
                 Ok(Ok(status)) => {
@@ -422,11 +418,7 @@ fn send_shutdown_signal(child: &tokio::process::Child) {
 }
 
 fn shell_program() -> &'static str {
-    if cfg!(windows) {
-        "cmd"
-    } else {
-        "sh"
-    }
+    if cfg!(windows) { "cmd" } else { "sh" }
 }
 
 fn shell_args(command: &str) -> Vec<&str> {
@@ -443,13 +435,13 @@ fn shell_args(command: &str) -> Vec<&str> {
 #[cfg(windows)]
 mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, CREATE_NEW_PROCESS_GROUP};
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, GetCurrentProcess};
 
     /// RAII guard that holds the job object handle. Children assigned to this
     /// job are killed when the handle is closed (including on parent crash).
@@ -519,8 +511,6 @@ mod win {
 // ---------------------------------------------------------------------------
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::process::CommandExt;
-
     pub fn configure_child(cmd: &mut tokio::process::Command) {
         unsafe {
             cmd.pre_exec(|| {
