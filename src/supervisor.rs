@@ -18,15 +18,18 @@ const TAIL_LINES: usize = 50;
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 type LogTail = Arc<Mutex<VecDeque<String>>>;
 type LogSink = Arc<Mutex<File>>;
+type LastOutput = Arc<Mutex<Instant>>;
 
 struct ManagedChild {
     name: String,
     wave: usize,
     child: tokio::process::Child,
     tail: LogTail,
+    last_output: LastOutput,
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -65,13 +68,15 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let mut child = spawn_service(name, service)?;
             let tail: LogTail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LINES)));
             let log_file = open_log_file(&session_dir, name)?;
-            let io_tasks = pipe_output(&mut child, name, &tail, &log_file);
+            let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
+            let io_tasks = pipe_output(&mut child, name, &tail, &log_file, &last_output);
 
             let managed = ManagedChild {
                 name: name.clone(),
                 wave: wave_idx,
                 child,
                 tail,
+                last_output,
                 io_tasks,
             };
 
@@ -89,7 +94,12 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         for mut managed in wave_oneshots {
             let mut rx = shutdown_rx.clone();
             let timeout = config.services[&managed.name].timeout;
-            let wait = wait_oneshot(&managed.name, &mut managed.child, timeout);
+            let wait = wait_oneshot(
+                &managed.name,
+                &mut managed.child,
+                timeout,
+                managed.last_output.clone(),
+            );
             let outcome = tokio::select! {
                 r = wait => r,
                 _ = rx.changed() => {
@@ -218,18 +228,21 @@ fn pipe_output(
     name: &str,
     tail: &LogTail,
     log_file: &LogSink,
+    last_output: &LastOutput,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut tasks = Vec::new();
     if let Some(stdout) = managed.stdout.take() {
         let n = name.to_string();
         let t = tail.clone();
         let f = log_file.clone();
+        let lo = last_output.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 println!("[{n}] {line}");
                 write_log_line(&f, &line);
                 push_tail(&t, line);
+                mark_output(&lo);
             }
         }));
     }
@@ -237,16 +250,24 @@ fn pipe_output(
         let n = name.to_string();
         let t = tail.clone();
         let f = log_file.clone();
+        let lo = last_output.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("[{n}] {line}");
                 write_log_line(&f, &line);
                 push_tail(&t, line);
+                mark_output(&lo);
             }
         }));
     }
     tasks
+}
+
+fn mark_output(last_output: &LastOutput) {
+    if let Ok(mut t) = last_output.lock() {
+        *t = Instant::now();
+    }
 }
 
 fn write_log_line(file: &LogSink, line: &str) {
@@ -326,6 +347,18 @@ async fn wait_oneshot(
     name: &str,
     child: &mut tokio::process::Child,
     timeout: Option<Duration>,
+    last_output: LastOutput,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let heartbeat = tokio::spawn(oneshot_heartbeat(name.to_string(), last_output));
+    let result = wait_oneshot_inner(name, child, timeout).await;
+    heartbeat.abort();
+    result
+}
+
+async fn wait_oneshot_inner(
+    name: &str,
+    child: &mut tokio::process::Child,
+    timeout: Option<Duration>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let Some(limit) = timeout else {
         return Ok(child.wait().await?);
@@ -344,6 +377,25 @@ async fn wait_oneshot(
     }
 }
 
+async fn oneshot_heartbeat(name: String, last_output: LastOutput) {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let last = match last_output.lock() {
+            Ok(g) => *g,
+            Err(_) => return,
+        };
+        let silent = last.elapsed();
+        if silent >= HEARTBEAT_INTERVAL {
+            eprintln!(
+                "arig: '{name}' still running (no output for {})",
+                humantime::format_duration(Duration::from_secs(silent.as_secs())),
+            );
+        }
+    }
+}
+
 async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
     let Some(tcp_addr) = probe.tcp.as_deref() else {
         return Ok(());
@@ -355,6 +407,7 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
     );
 
     let deadline = Instant::now() + probe.timeout;
+    let mut last_heartbeat = Instant::now();
     loop {
         let last_err: String =
             match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(tcp_addr)).await {
@@ -365,6 +418,13 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => "connect timed out".into(),
             };
+
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            eprintln!(
+                "arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})"
+            );
+            last_heartbeat = Instant::now();
+        }
 
         if Instant::now() >= deadline {
             anyhow::bail!(
