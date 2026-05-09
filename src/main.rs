@@ -26,6 +26,8 @@ enum Commands {
     Up,
     /// Stop all services
     Down,
+    /// Print the JSON schema for arig.yaml to stdout
+    Schema,
 }
 
 #[tokio::main]
@@ -38,6 +40,12 @@ async fn main() -> anyhow::Result<()> {
         })?;
     }
 
+    if let Commands::Schema = cli.command {
+        let schema = schemars::schema_for!(config::ArigConfig);
+        println!("{}", serde_json::to_string_pretty(&schema)?);
+        return Ok(());
+    }
+
     let config = config::ArigConfig::load(&cli.file)?;
 
     match cli.command {
@@ -45,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Down => {
             eprintln!("down: not yet implemented");
         }
+        Commands::Schema => unreachable!(),
     }
 
     Ok(())
