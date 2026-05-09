@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "arig", about = "Polyglot service orchestrator")]
+#[command(name = "arig", version, about = "Polyglot service orchestrator")]
 struct Cli {
     /// Change to DIR before doing anything else (like git -C).
     #[arg(short = 'C', long = "directory", value_name = "DIR")]
