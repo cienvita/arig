@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArigConfig",
+  "description": "Top-level arig config. Lives at `arig.yaml` by default.",
+  "type": "object",
+  "properties": {
+    "services": {
+      "description": "Services to supervise, keyed by service name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ServiceConfig"
+      }
+    }
+  },
+  "required": [
+    "services"
+  ],
+  "$defs": {
+    "ReadyProbe": {
+      "type": "object",
+      "properties": {
+        "tcp": {
+          "description": "TCP host:port to connect to. Probe passes when connect() succeeds.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout": {
+          "description": "Total time to keep retrying before giving up. e.g. \"30s\", \"1m 30s\".",
+          "type": "string",
+          "default": "1m"
+        }
+      }
+    },
+    "ServiceConfig": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Command line to execute. Run via the system shell.",
+          "type": "string"
+        },
+        "depends_on": {
+          "description": "Other service names that must be ready before this one starts.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "description": "Extra environment variables to set for the process.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "ready": {
+          "description": "Optional readiness probe. Dependents wait until this passes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReadyProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ServiceType"
+        },
+        "working_dir": {
+          "description": "Working directory for the command. Relative to the config file's directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ]
+    },
+    "ServiceType": {
+      "description": "How arig should treat a service for shutdown and exit semantics.",
+      "oneOf": [
+        {
+          "description": "Long-running process; arig keeps it alive and stops it on shutdown.",
+          "type": "string",
+          "const": "service"
+        },
+        {
+          "description": "Runs to completion once; arig waits for exit before dependents start.",
+          "type": "string",
+          "const": "oneshot"
+        }
+      ]
+    }
+  }
+}
