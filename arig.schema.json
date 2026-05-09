@@ -67,6 +67,14 @@
             }
           ]
         },
+        "timeout": {
+          "description": "Maximum time a oneshot may run before it's killed and the wave fails.\nIgnored for long-running services. e.g. \"5m\", \"30s\". No default: opt-in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "type": {
           "$ref": "#/$defs/ServiceType"
         },

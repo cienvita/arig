@@ -88,8 +88,10 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         // Wait for all oneshots in this wave to finish before next wave
         for mut managed in wave_oneshots {
             let mut rx = shutdown_rx.clone();
-            let status = tokio::select! {
-                s = managed.child.wait() => s?,
+            let timeout = config.services[&managed.name].timeout;
+            let wait = wait_oneshot(&managed.name, &mut managed.child, timeout);
+            let outcome = tokio::select! {
+                r = wait => r,
                 _ = rx.changed() => {
                     eprintln!("\narig: shutting down...");
                     shutdown(&mut children, None).await;
@@ -98,14 +100,25 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
                 }
             };
 
-            if !status.success() {
-                eprintln!("arig: oneshot '{}' failed ({status})", managed.name);
-                drain_io(&mut managed.io_tasks).await;
-                dump_tail(&managed.name, &managed.tail);
-                shutdown(&mut children, None).await;
-                anyhow::bail!("oneshot '{}' failed", managed.name);
+            match outcome {
+                Ok(status) if status.success() => {
+                    eprintln!("arig: oneshot '{}' completed", managed.name);
+                }
+                Ok(status) => {
+                    eprintln!("arig: oneshot '{}' failed ({status})", managed.name);
+                    drain_io(&mut managed.io_tasks).await;
+                    dump_tail(&managed.name, &managed.tail);
+                    shutdown(&mut children, None).await;
+                    anyhow::bail!("oneshot '{}' failed", managed.name);
+                }
+                Err(err) => {
+                    eprintln!("arig: {err}");
+                    drain_io(&mut managed.io_tasks).await;
+                    dump_tail(&managed.name, &managed.tail);
+                    shutdown(&mut children, None).await;
+                    anyhow::bail!("oneshot '{}' failed", managed.name);
+                }
             }
-            eprintln!("arig: oneshot '{}' completed", managed.name);
         }
 
         // Block on readiness probes for long-running services in this wave
@@ -307,6 +320,28 @@ fn dump_tail(name: &str, tail: &LogTail) {
         eprintln!("[{name}] {line}");
     }
     eprintln!("arig: --- end '{name}' tail ---");
+}
+
+async fn wait_oneshot(
+    name: &str,
+    child: &mut tokio::process::Child,
+    timeout: Option<Duration>,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let Some(limit) = timeout else {
+        return Ok(child.wait().await?);
+    };
+
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "oneshot '{name}' timed out after {}",
+                humantime::format_duration(limit)
+            );
+        }
+    }
 }
 
 async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
