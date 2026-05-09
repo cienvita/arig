@@ -511,8 +511,6 @@ mod win {
 // ---------------------------------------------------------------------------
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::process::CommandExt;
-
     pub fn configure_child(cmd: &mut tokio::process::Command) {
         unsafe {
             cmd.pre_exec(|| {
