@@ -420,9 +420,7 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
             };
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            eprintln!(
-                "arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})"
-            );
+            eprintln!("arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})");
             last_heartbeat = Instant::now();
         }
 
