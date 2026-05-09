@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
@@ -23,6 +23,22 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 type LogTail = Arc<Mutex<VecDeque<String>>>;
 type LogSink = Arc<Mutex<File>>;
 type LastOutput = Arc<Mutex<Instant>>;
+
+// Session-wide log file for arig's own messages. Set once in `up` after the
+// session dir exists, then read by `event!` on every `arig:` line.
+static EVENT_LOG: OnceLock<LogSink> = OnceLock::new();
+
+macro_rules! event {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        eprintln!("{s}");
+        if let Some(f) = $crate::supervisor::EVENT_LOG.get()
+            && let Ok(mut g) = f.lock()
+        {
+            let _ = writeln!(*g, "{s}");
+        }
+    }};
+}
 
 struct ManagedChild {
     name: String,
@@ -54,7 +70,9 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     }
 
     let session_dir = create_session_dir()?;
-    eprintln!("arig: logs at {}", session_dir.display());
+    let event_log = open_log_file(&session_dir, "_arig")?;
+    let _ = EVENT_LOG.set(event_log);
+    event!("arig: logs at {}", session_dir.display());
 
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
@@ -103,26 +121,26 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let outcome = tokio::select! {
                 r = wait => r,
                 _ = rx.changed() => {
-                    eprintln!("\narig: shutting down...");
+                    event!("\narig: shutting down...");
                     shutdown(&mut children, None).await;
-                    eprintln!("arig: all services stopped.");
+                    event!("arig: all services stopped.");
                     return Ok(());
                 }
             };
 
             match outcome {
                 Ok(status) if status.success() => {
-                    eprintln!("arig: oneshot '{}' completed", managed.name);
+                    event!("arig: oneshot '{}' completed", managed.name);
                 }
                 Ok(status) => {
-                    eprintln!("arig: oneshot '{}' failed ({status})", managed.name);
+                    event!("arig: oneshot '{}' failed ({status})", managed.name);
                     drain_io(&mut managed.io_tasks).await;
                     dump_tail(&managed.name, &managed.tail);
                     shutdown(&mut children, None).await;
                     anyhow::bail!("oneshot '{}' failed", managed.name);
                 }
                 Err(err) => {
-                    eprintln!("arig: {err}");
+                    event!("arig: {err}");
                     drain_io(&mut managed.io_tasks).await;
                     dump_tail(&managed.name, &managed.tail);
                     shutdown(&mut children, None).await;
@@ -137,15 +155,15 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let result = tokio::select! {
                 r = wait_ready(&name, &probe) => r,
                 _ = rx.changed() => {
-                    eprintln!("\narig: shutting down...");
+                    event!("\narig: shutting down...");
                     shutdown(&mut children, None).await;
-                    eprintln!("arig: all services stopped.");
+                    event!("arig: all services stopped.");
                     return Ok(());
                 }
             };
 
             if let Err(err) = result {
-                eprintln!("arig: {err}");
+                event!("arig: {err}");
                 if let Some(idx) = children.iter().position(|c| c.name == name) {
                     drain_io(&mut children[idx].io_tasks).await;
                     let n = children[idx].name.clone();
@@ -158,11 +176,11 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     }
 
     if children.is_empty() {
-        eprintln!("arig: all tasks completed.");
+        event!("arig: all tasks completed.");
         return Ok(());
     }
 
-    eprintln!(
+    event!(
         "arig: {} service(s) running. Press Ctrl+C to stop.",
         children.len()
     );
@@ -189,11 +207,11 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let skip_idx = exit.as_ref().map(|(idx, _)| *idx);
     let bail = match exit {
         None => {
-            eprintln!("\narig: shutting down...");
+            event!("\narig: shutting down...");
             false
         }
         Some((idx, Ok(status))) => {
-            eprintln!(
+            event!(
                 "arig: service '{}' exited (status {status}); long-running services aren't expected to exit, shutting down the rest",
                 children[idx].name
             );
@@ -203,7 +221,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             true
         }
         Some((idx, Err(err))) => {
-            eprintln!(
+            event!(
                 "arig: service '{}' wait failed ({err}); shutting down the rest",
                 children[idx].name
             );
@@ -216,7 +234,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
 
     shutdown(&mut children, skip_idx).await;
 
-    eprintln!("arig: all services stopped.");
+    event!("arig: all services stopped.");
     if bail {
         anyhow::bail!("a service exited unexpectedly");
     }
@@ -336,11 +354,11 @@ fn dump_tail(name: &str, tail: &LogTail) {
     if q.is_empty() {
         return;
     }
-    eprintln!("arig: --- last {} line(s) from '{}' ---", q.len(), name);
+    event!("arig: --- last {} line(s) from '{}' ---", q.len(), name);
     for line in q.iter() {
-        eprintln!("[{name}] {line}");
+        event!("[{name}] {line}");
     }
-    eprintln!("arig: --- end '{name}' tail ---");
+    event!("arig: --- end '{name}' tail ---");
 }
 
 async fn wait_oneshot(
@@ -388,7 +406,7 @@ async fn oneshot_heartbeat(name: String, last_output: LastOutput) {
         };
         let silent = last.elapsed();
         if silent >= HEARTBEAT_INTERVAL {
-            eprintln!(
+            event!(
                 "arig: '{name}' still running (no output for {})",
                 humantime::format_duration(Duration::from_secs(silent.as_secs())),
             );
@@ -401,7 +419,7 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    eprintln!(
+    event!(
         "arig: waiting for '{name}' tcp probe on {tcp_addr} (timeout {})",
         humantime::format_duration(probe.timeout),
     );
@@ -412,7 +430,7 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
         let last_err: String =
             match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(tcp_addr)).await {
                 Ok(Ok(_)) => {
-                    eprintln!("arig: '{name}' is ready");
+                    event!("arig: '{name}' is ready");
                     return Ok(());
                 }
                 Ok(Err(e)) => e.to_string(),
@@ -420,7 +438,7 @@ async fn wait_ready(name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
             };
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            eprintln!("arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})");
+            event!("arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})");
             last_heartbeat = Instant::now();
         }
 
@@ -454,7 +472,7 @@ fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::p
 
     let child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
-    eprintln!("arig: started {name} (PID {pid})");
+    event!("arig: started {name} (PID {pid})");
     Ok(child)
 }
 
@@ -485,10 +503,10 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
 
             match graceful {
                 Ok(Ok(status)) => {
-                    eprintln!("arig: {} stopped ({status})", managed.name);
+                    event!("arig: {} stopped ({status})", managed.name);
                 }
                 _ => {
-                    eprintln!("arig: {} did not stop in time, force killing", managed.name);
+                    event!("arig: {} did not stop in time, force killing", managed.name);
                     let _ = managed.child.kill().await;
                 }
             }
