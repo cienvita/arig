@@ -28,6 +28,18 @@ Reads `arig.yaml` in the current directory. Example:
         working_dir: ./api
         depends_on: [migrate]
 
+## Editor integration
+
+A JSON schema for `arig.yaml` is checked in at `arig.schema.json`. With the
+YAML language server installed, add a directive at the top of your config:
+
+    # yaml-language-server: $schema=https://raw.githubusercontent.com/cienvita/arig/main/arig.schema.json
+
+To match the schema to your installed binary instead, generate it locally:
+
+    arig schema > arig.schema.json
+    # yaml-language-server: $schema=./arig.schema.json
+
 ## Todo
 
 Near-term:
