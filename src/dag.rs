@@ -83,6 +83,7 @@ mod tests {
             env: HashMap::new(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
             ready: None,
+            timeout: None,
         }
     }
 
