@@ -35,9 +35,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(dir) = &cli.directory {
-        std::env::set_current_dir(dir).map_err(|e| {
-            anyhow::anyhow!("failed to chdir to {}: {e}", dir.display())
-        })?;
+        std::env::set_current_dir(dir)
+            .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", dir.display()))?;
     }
 
     if let Commands::Schema = cli.command {

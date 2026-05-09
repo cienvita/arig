@@ -25,7 +25,10 @@ pub fn toposort(config: &ArigConfig) -> anyhow::Result<Vec<Vec<String>>> {
     for (name, service) in &config.services {
         in_degree.insert(name.as_str(), service.depends_on.len());
         for dep in &service.depends_on {
-            dependents.entry(dep.as_str()).or_default().push(name.as_str());
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(name.as_str());
         }
     }
 
@@ -143,9 +146,7 @@ mod tests {
     #[test]
     fn unknown_dependency() {
         let config = ArigConfig {
-            services: HashMap::from([
-                ("a".into(), svc("echo a", vec!["nonexistent"])),
-            ]),
+            services: HashMap::from([("a".into(), svc("echo a", vec!["nonexistent"]))]),
         };
         assert!(toposort(&config).is_err());
     }
