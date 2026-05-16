@@ -4,6 +4,10 @@
   "description": "Top-level arig config. Lives at `arig.yaml` by default.",
   "type": "object",
   "properties": {
+    "dirs": {
+      "description": "Directories arig writes to. Defaults under `.arig/var/`.",
+      "$ref": "#/$defs/DirsConfig"
+    },
     "services": {
       "description": "Services to supervise, keyed by service name.",
       "type": "object",
@@ -16,6 +20,22 @@
     "services"
   ],
   "$defs": {
+    "DirsConfig": {
+      "description": "Filesystem locations arig manages.",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "description": "Base directory for per-session log folders.",
+          "type": "string",
+          "default": ".arig/var/logs"
+        },
+        "tmp": {
+          "description": "Scratch directory for temporary files.",
+          "type": "string",
+          "default": ".arig/var/tmp"
+        }
+      }
+    },
     "ReadyProbe": {
       "type": "object",
       "properties": {
