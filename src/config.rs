@@ -1,14 +1,46 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level arig config. Lives at `arig.yaml` by default.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArigConfig {
+    /// Directories arig writes to. Defaults under `.arig/var/`.
+    #[serde(default)]
+    pub dirs: DirsConfig,
     /// Services to supervise, keyed by service name.
     pub services: HashMap<String, ServiceConfig>,
+}
+
+/// Filesystem locations arig manages.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DirsConfig {
+    /// Base directory for per-session log folders.
+    #[serde(default = "default_logs_dir")]
+    pub logs: PathBuf,
+    /// Scratch directory for temporary files.
+    #[serde(default = "default_tmp_dir")]
+    #[allow(dead_code)]
+    pub tmp: PathBuf,
+}
+
+impl Default for DirsConfig {
+    fn default() -> Self {
+        Self {
+            logs: default_logs_dir(),
+            tmp: default_tmp_dir(),
+        }
+    }
+}
+
+fn default_logs_dir() -> PathBuf {
+    PathBuf::from(".arig/var/logs")
+}
+
+fn default_tmp_dir() -> PathBuf {
+    PathBuf::from(".arig/var/tmp")
 }
 
 /// How arig should treat a service for shutdown and exit semantics.
