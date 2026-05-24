@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create `.arig/` and `.arig/.gitignore`
+    Init,
     /// Build and start all services
     Up,
     /// Stop all services
@@ -39,10 +41,17 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", dir.display()))?;
     }
 
-    if let Commands::Schema = cli.command {
-        let schema = schemars::schema_for!(config::ArigConfig);
-        println!("{}", serde_json::to_string_pretty(&schema)?);
-        return Ok(());
+    match &cli.command {
+        Commands::Schema => {
+            let schema = schemars::schema_for!(config::ArigConfig);
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+            return Ok(());
+        }
+        Commands::Init => {
+            init()?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     let config = config::ArigConfig::load(&cli.file)?;
@@ -52,8 +61,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::Down => {
             eprintln!("down: not yet implemented");
         }
-        Commands::Schema => unreachable!(),
+        Commands::Init | Commands::Schema => unreachable!(),
     }
 
+    Ok(())
+}
+
+fn init() -> anyhow::Result<()> {
+    let arig_dir = std::path::Path::new(".arig");
+    std::fs::create_dir_all(arig_dir)?;
+    let gitignore = arig_dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, "var/\n")?;
+    }
+    println!("arig: initialized {}", arig_dir.display());
     Ok(())
 }

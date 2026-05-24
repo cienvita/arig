@@ -69,7 +69,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         });
     }
 
-    let session_dir = create_session_dir()?;
+    let session_dir = create_session_dir(&config.dirs.logs)?;
     let event_log = open_log_file(&session_dir, "_arig")?;
     let _ = EVENT_LOG.set(event_log);
     event!("arig: logs at {}", session_dir.display());
@@ -294,15 +294,15 @@ fn write_log_line(file: &LogSink, line: &str) {
     }
 }
 
-fn create_session_dir() -> anyhow::Result<PathBuf> {
+fn create_session_dir(base: &Path) -> anyhow::Result<PathBuf> {
     let stamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
-    let dir = PathBuf::from(".logs").join(&stamp);
+    let dir = base.join(&stamp);
     std::fs::create_dir_all(&dir)?;
 
-    // Best-effort `.logs/latest` pointer to the freshest run. On Windows this
+    // Best-effort `latest` pointer to the freshest run. On Windows this
     // needs Developer Mode (or admin) to create a symlink; on failure we just
-    // skip silently — the timestamped dir is the source of truth.
-    let latest = PathBuf::from(".logs").join("latest");
+    // skip silently - the timestamped dir is the source of truth.
+    let latest = base.join("latest");
     let _ = std::fs::remove_file(&latest);
     let _ = std::fs::remove_dir(&latest);
     let _ = create_dir_link(&dir, &latest);
@@ -312,7 +312,7 @@ fn create_session_dir() -> anyhow::Result<PathBuf> {
 
 #[cfg(windows)]
 fn create_dir_link(target: &Path, link: &Path) -> std::io::Result<()> {
-    // Use a relative target so the link survives if .logs/ is moved.
+    // Use a relative target so the link survives if the logs dir is moved.
     let rel = target
         .file_name()
         .map(PathBuf::from)

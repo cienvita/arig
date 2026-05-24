@@ -90,6 +90,7 @@ mod tests {
     #[test]
     fn no_dependencies() {
         let config = ArigConfig {
+            dirs: Default::default(),
             services: HashMap::from([
                 ("a".into(), svc("echo a", vec![])),
                 ("b".into(), svc("echo b", vec![])),
@@ -103,6 +104,7 @@ mod tests {
     #[test]
     fn linear_chain() {
         let config = ArigConfig {
+            dirs: Default::default(),
             services: HashMap::from([
                 ("db".into(), svc("echo db", vec![])),
                 ("api".into(), svc("echo api", vec!["db"])),
@@ -119,6 +121,7 @@ mod tests {
     #[test]
     fn diamond() {
         let config = ArigConfig {
+            dirs: Default::default(),
             services: HashMap::from([
                 ("db".into(), svc("echo db", vec![])),
                 ("cache".into(), svc("echo cache", vec!["db"])),
@@ -137,6 +140,7 @@ mod tests {
     #[test]
     fn cycle_detected() {
         let config = ArigConfig {
+            dirs: Default::default(),
             services: HashMap::from([
                 ("a".into(), svc("echo a", vec!["b"])),
                 ("b".into(), svc("echo b", vec!["a"])),
@@ -148,6 +152,7 @@ mod tests {
     #[test]
     fn unknown_dependency() {
         let config = ArigConfig {
+            dirs: Default::default(),
             services: HashMap::from([("a".into(), svc("echo a", vec!["nonexistent"]))]),
         };
         assert!(toposort(&config).is_err());
