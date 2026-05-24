@@ -1,5 +1,7 @@
 use crate::config::{ArigConfig, ReadyProbe, ServiceConfig, ServiceType};
 use crate::dag;
+use crate::ipc;
+use anyhow::Context;
 use chrono::Local;
 use futures::future::select_all;
 use std::collections::VecDeque;
@@ -49,6 +51,14 @@ struct ManagedChild {
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+struct IpcCleanup(ipc::Endpoint);
+
+impl Drop for IpcCleanup {
+    fn drop(&mut self) {
+        ipc::cleanup(&self.0);
+    }
+}
+
 pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     #[cfg(windows)]
     let _job = win::JobGuard::new()?;
@@ -73,6 +83,13 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let event_log = open_log_file(&session_dir, "_arig")?;
     let _ = EVENT_LOG.set(event_log);
     event!("arig: logs at {}", session_dir.display());
+
+    let workspace = std::env::current_dir().context("read current dir")?;
+    let endpoint = ipc::Endpoint::for_workspace(&workspace)?;
+    let listener = ipc::bind(&endpoint)?;
+    let _ipc_cleanup = IpcCleanup(endpoint.clone());
+    let _ipc_task = tokio::spawn(ipc::serve(listener, endpoint.address.clone()));
+    event!("arig: ipc bound at {}", endpoint.address);
 
     let waves = dag::toposort(&config)?;
     let mut children: Vec<ManagedChild> = Vec::new();
@@ -239,6 +256,107 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         anyhow::bail!("a service exited unexpectedly");
     }
     Ok(())
+}
+
+/// Spawn the current binary as a detached `__supervise` process, wait until it
+/// binds its IPC endpoint, then return. The caller process exits normally.
+pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
+    // Pass cwd as-is to the child; Endpoint::for_workspace canonicalizes
+    // internally for the hash. Canonicalizing here would yield `\\?\` paths on
+    // Windows, which CMD.EXE refuses as a working directory for service
+    // commands.
+    let workspace = std::env::current_dir().context("read current dir")?;
+    let endpoint = ipc::Endpoint::for_workspace(&workspace)?;
+
+    if ipc::probe(&endpoint).await {
+        anyhow::bail!(
+            "a supervisor is already running for this workspace at {}",
+            endpoint.address
+        );
+    }
+
+    let exe = std::env::current_exe().context("locate current exe")?;
+    let var_dir = workspace.join(".arig/var");
+    std::fs::create_dir_all(&var_dir).with_context(|| format!("create {}", var_dir.display()))?;
+    let log_path = var_dir.join("supervisor.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--file").arg(config_file);
+    cmd.arg("__supervise").arg("--workspace").arg(&workspace);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(log.try_clone()?));
+    cmd.stderr(Stdio::from(log));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // New session detaches us from the spawning shell's controlling
+                // tty, so closing the terminal doesn't SIGHUP the supervisor.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = spawn_detached(&mut cmd)?;
+    let pid = child.id();
+    eprintln!("arig: spawned supervisor (pid {pid})");
+
+    match ipc::wait_ready(&endpoint, Duration::from_secs(10)).await {
+        Ok(()) => {
+            eprintln!("arig: supervisor ready at {}", endpoint.address);
+            eprintln!("arig: log at {}", log_path.display());
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("{e}. check {} for details", log_path.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_detached(cmd: &mut std::process::Command) -> anyhow::Result<std::process::Child> {
+    cmd.spawn().context("spawn detached supervisor")
+}
+
+#[cfg(windows)]
+fn spawn_detached(cmd: &mut std::process::Command) -> anyhow::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS: no console attachment.
+    // CREATE_NEW_PROCESS_GROUP: own group so it doesn't share our Ctrl+C.
+    // CREATE_BREAKAWAY_FROM_JOB: escape any job we (or our parent) sit in that
+    // has KILL_ON_JOB_CLOSE, so the supervisor outlives this CLI.
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        Ok(c) => Ok(c),
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            // The outer job (a shell wrapper, a terminal multiplexer, or this
+            // session's harness) does not allow CREATE_BREAKAWAY_FROM_JOB.
+            // Retry without it: the supervisor will be assigned to that job
+            // and may die when it closes if KILL_ON_JOB_CLOSE is set.
+            eprintln!(
+                "arig: outer job denied breakaway; supervisor will inherit it (closing this shell may kill it)"
+            );
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            cmd.spawn()
+                .context("spawn detached supervisor (no breakaway)")
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("spawn detached supervisor")),
+    }
 }
 
 fn pipe_output(
@@ -546,13 +664,21 @@ fn shell_args(command: &str) -> Vec<&str> {
 #[cfg(windows)]
 mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleWindow,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, GetCurrentProcess};
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    fn has_console() -> bool {
+        unsafe { !GetConsoleWindow().is_null() }
+    }
 
     /// RAII guard that holds the job object handle. Children assigned to this
     /// job are killed when the handle is closed (including on parent crash).
@@ -598,12 +724,19 @@ mod win {
     }
 
     pub fn configure_child(cmd: &mut tokio::process::Command) {
-        // Children inherit the parent's job object (kill-on-close safety net).
-        // CREATE_NEW_PROCESS_GROUP makes each child the leader of its own
-        // group, so we can target it individually with GenerateConsoleCtrlEvent.
-        // It also detaches the child from the parent's Ctrl+C — we drive
-        // shutdown explicitly via send_ctrl_break.
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        // CREATE_NEW_PROCESS_GROUP: each child leads its own group so we can
+        // target it individually with GenerateConsoleCtrlEvent. It also
+        // detaches the child from the parent's Ctrl+C; we drive shutdown
+        // explicitly via send_ctrl_break.
+        // CREATE_NO_WINDOW: a detached supervisor has no console, and without
+        // this flag Windows allocates a fresh console window for every cmd.exe
+        // child. We only add it when we're console-less so the foreground
+        // case keeps sharing a console (CTRL_BREAK_EVENT needs that).
+        let mut flags = CREATE_NEW_PROCESS_GROUP;
+        if !has_console() {
+            flags |= CREATE_NO_WINDOW;
+        }
+        cmd.creation_flags(flags);
     }
 
     /// Send CTRL_BREAK_EVENT to a single child's process group.
