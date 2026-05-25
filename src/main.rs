@@ -1,5 +1,8 @@
+mod client;
 mod config;
 mod dag;
+mod ipc;
+mod protocol;
 mod supervisor;
 
 use clap::{Parser, Subcommand};
@@ -25,11 +28,24 @@ enum Commands {
     /// Create `.arig/` and `.arig/.gitignore`
     Init,
     /// Build and start all services
-    Up,
+    Up {
+        /// Run the supervisor in the background; the CLI returns once it is ready.
+        #[arg(short = 'd', long = "detach")]
+        detach: bool,
+    },
     /// Stop all services
     Down,
+    /// List services tracked by the supervisor for this workspace
+    Ps,
     /// Print the JSON schema for arig.yaml to stdout
     Schema,
+    /// Internal: act as a workspace supervisor. Spawned by `arig up --detach`.
+    #[command(name = "__supervise", hide = true)]
+    Supervise {
+        /// Absolute path to the workspace this supervisor manages.
+        #[arg(long)]
+        workspace: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -41,30 +57,36 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", dir.display()))?;
     }
 
-    match &cli.command {
+    match cli.command {
         Commands::Schema => {
             let schema = schemars::schema_for!(config::ArigConfig);
             println!("{}", serde_json::to_string_pretty(&schema)?);
-            return Ok(());
+            Ok(())
         }
-        Commands::Init => {
-            init()?;
-            return Ok(());
+        Commands::Init => init(),
+        Commands::Supervise { workspace } => {
+            std::env::set_current_dir(&workspace)
+                .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", workspace.display()))?;
+            let config = config::ArigConfig::load(&cli.file)?;
+            supervisor::up(config).await
         }
-        _ => {}
-    }
-
-    let config = config::ArigConfig::load(&cli.file)?;
-
-    match cli.command {
-        Commands::Up => supervisor::up(config).await?,
+        Commands::Up { detach } => {
+            let config = config::ArigConfig::load(&cli.file)?;
+            if detach {
+                supervisor::detach_and_exit(&cli.file).await
+            } else {
+                supervisor::up(config).await
+            }
+        }
         Commands::Down => {
-            eprintln!("down: not yet implemented");
+            let cwd = std::env::current_dir()?;
+            client::down(&cwd).await
         }
-        Commands::Init | Commands::Schema => unreachable!(),
+        Commands::Ps => {
+            let cwd = std::env::current_dir()?;
+            client::ps(&cwd).await
+        }
     }
-
-    Ok(())
 }
 
 fn init() -> anyhow::Result<()> {
