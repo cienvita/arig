@@ -1,6 +1,8 @@
+mod client;
 mod config;
 mod dag;
 mod ipc;
+mod protocol;
 mod supervisor;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +35,8 @@ enum Commands {
     },
     /// Stop all services
     Down,
+    /// List services tracked by the supervisor for this workspace
+    Ps,
     /// Print the JSON schema for arig.yaml to stdout
     Schema,
     /// Internal: act as a workspace supervisor. Spawned by `arig up --detach`.
@@ -75,8 +79,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Down => {
-            eprintln!("down: not yet implemented");
-            Ok(())
+            let cwd = std::env::current_dir()?;
+            client::down(&cwd).await
+        }
+        Commands::Ps => {
+            let cwd = std::env::current_dir()?;
+            client::ps(&cwd).await
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::config::{ArigConfig, ReadyProbe, ServiceConfig, ServiceType};
 use crate::dag;
 use crate::ipc;
+use crate::protocol;
 use anyhow::Context;
 use chrono::Local;
 use futures::future::select_all;
@@ -15,6 +16,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::signal;
+
+type ServiceState = Arc<Mutex<Vec<protocol::ServiceSnapshot>>>;
 
 const TAIL_LINES: usize = 50;
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -88,7 +91,13 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let endpoint = ipc::Endpoint::for_workspace(&workspace)?;
     let listener = ipc::bind(&endpoint)?;
     let _ipc_cleanup = IpcCleanup(endpoint.clone());
-    let _ipc_task = tokio::spawn(ipc::serve(listener, endpoint.address.clone()));
+    let state: ServiceState = Arc::new(Mutex::new(Vec::new()));
+    let acceptor = ipc::Acceptor::new(listener, endpoint.address.clone());
+    let _ipc_task = tokio::spawn(ipc_accept_loop(
+        acceptor,
+        state.clone(),
+        shutdown_tx.clone(),
+    ));
     event!("arig: ipc bound at {}", endpoint.address);
 
     let waves = dag::toposort(&config)?;
@@ -101,6 +110,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         for name in wave {
             let service = &config.services[name];
             let mut child = spawn_service(name, service)?;
+            let pid = child.id().unwrap_or(0);
             let tail: LogTail = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LINES)));
             let log_file = open_log_file(&session_dir, name)?;
             let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
@@ -114,6 +124,17 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
                 last_output,
                 io_tasks,
             };
+
+            state.lock().unwrap().push(protocol::ServiceSnapshot {
+                name: name.clone(),
+                kind: match service.service_type {
+                    ServiceType::Service => "service".into(),
+                    ServiceType::Oneshot => "oneshot".into(),
+                },
+                wave: wave_idx,
+                pid,
+                status: "running".into(),
+            });
 
             if service.service_type == ServiceType::Oneshot {
                 wave_oneshots.push(managed);
@@ -148,6 +169,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             match outcome {
                 Ok(status) if status.success() => {
                     event!("arig: oneshot '{}' completed", managed.name);
+                    state.lock().unwrap().retain(|s| s.name != managed.name);
                 }
                 Ok(status) => {
                     event!("arig: oneshot '{}' failed ({status})", managed.name);
@@ -319,6 +341,52 @@ pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
         }
         Err(e) => {
             anyhow::bail!("{e}. check {} for details", log_path.display());
+        }
+    }
+}
+
+async fn ipc_accept_loop(
+    mut acceptor: ipc::Acceptor,
+    state: ServiceState,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    loop {
+        let stream = match acceptor.accept().await {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let st = state.clone();
+        let sd = shutdown_tx.clone();
+        tokio::spawn(async move {
+            handle_client(stream, st, sd).await;
+        });
+    }
+}
+
+async fn handle_client(
+    stream: ipc::ServerStream,
+    state: ServiceState,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let (rd, mut wr) = tokio::io::split(stream);
+    let req = match protocol::read_request(rd).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ =
+                protocol::write_response(&mut wr, &protocol::Response::err(e.to_string())).await;
+            return;
+        }
+    };
+    match req {
+        protocol::Request::Ps => {
+            let snap = state.lock().unwrap().clone();
+            let _ = protocol::write_response(&mut wr, &protocol::Response::ps(snap)).await;
+        }
+        protocol::Request::Down => {
+            // Flush response before triggering shutdown so the client always
+            // sees the ack even if the supervisor exits quickly.
+            let _ = protocol::write_response(&mut wr, &protocol::Response::ok()).await;
+            let _ = shutdown_tx.send(true);
         }
     }
 }

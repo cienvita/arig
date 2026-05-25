@@ -68,6 +68,18 @@ pub type Listener = tokio::net::UnixListener;
 #[cfg(windows)]
 pub type Listener = tokio::net::windows::named_pipe::NamedPipeServer;
 
+/// Server-side stream returned by Acceptor::accept. Duplex AsyncRead+AsyncWrite.
+#[cfg(unix)]
+pub type ServerStream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type ServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// Client-side stream returned by connect. Duplex AsyncRead+AsyncWrite.
+#[cfg(unix)]
+pub type Stream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
+
 #[cfg(unix)]
 pub fn bind(endpoint: &Endpoint) -> Result<Listener> {
     std::fs::create_dir_all(&endpoint.parent)
@@ -135,31 +147,69 @@ pub fn cleanup(endpoint: &Endpoint) {
     }
 }
 
-#[cfg(unix)]
-pub async fn serve(listener: Listener, _name: String) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => drop(stream),
-            Err(_) => break,
+/// Hides per-platform accept idioms: Unix listeners hand out streams forever,
+/// Windows named pipes serve one client per instance and must reserve the next
+/// before releasing the old one.
+pub struct Acceptor {
+    #[cfg(unix)]
+    listener: Listener,
+    #[cfg(windows)]
+    current: Option<Listener>,
+    #[cfg(windows)]
+    name: String,
+}
+
+impl Acceptor {
+    #[cfg(unix)]
+    pub fn new(listener: Listener, _name: String) -> Self {
+        Self { listener }
+    }
+
+    #[cfg(windows)]
+    pub fn new(listener: Listener, name: String) -> Self {
+        Self {
+            current: Some(listener),
+            name,
         }
+    }
+
+    #[cfg(unix)]
+    pub async fn accept(&mut self) -> Result<ServerStream> {
+        let (stream, _) = self.listener.accept().await.context("accept")?;
+        Ok(stream)
+    }
+
+    #[cfg(windows)]
+    pub async fn accept(&mut self) -> Result<ServerStream> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let server = self
+            .current
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("acceptor not initialised"))?;
+        server.connect().await.context("connect named pipe")?;
+        // Reserve the next instance before yielding the current one so a
+        // racing client doesn't see a momentary gap in the pipe name.
+        let next = ServerOptions::new()
+            .create(&self.name)
+            .context("create next pipe instance")?;
+        self.current = Some(next);
+        Ok(server)
     }
 }
 
+#[cfg(unix)]
+pub async fn connect(endpoint: &Endpoint) -> Result<Stream> {
+    Stream::connect(&endpoint.address)
+        .await
+        .with_context(|| format!("connect {}", endpoint.address))
+}
+
 #[cfg(windows)]
-pub async fn serve(mut server: Listener, name: String) {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    loop {
-        if server.connect().await.is_err() {
-            break;
-        }
-        // Reserve the next instance before dropping the connected one so a
-        // racing client doesn't see a momentary gap in the pipe name.
-        let next = match ServerOptions::new().create(&name) {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        let _connected = std::mem::replace(&mut server, next);
-    }
+pub async fn connect(endpoint: &Endpoint) -> Result<Stream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    ClientOptions::new()
+        .open(&endpoint.address)
+        .with_context(|| format!("connect {}", endpoint.address))
 }
 
 #[cfg(unix)]
