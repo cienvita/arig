@@ -750,9 +750,7 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
                                 // Hook ran but the main child did not exit within
                                 // the configured timeout. Give it a SIGTERM + 5 s
                                 // grace period before force-killing.
-                                event!(
-                                    "arig: {name} did not stop after shutdown hook, signalling"
-                                );
+                                event!("arig: {name} did not stop after shutdown hook, signalling");
                                 send_shutdown_signal(&managed.child);
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
@@ -787,11 +785,8 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
                     }
                 }
             } else {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    managed.child.wait(),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(5), managed.child.wait())
+                    .await
                 {
                     Ok(Ok(status)) => event!("arig: {name} stopped ({status})"),
                     _ => {
