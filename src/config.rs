@@ -75,6 +75,26 @@ pub struct ServiceConfig {
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
+    /// Optional shutdown hook. When present, this command is run instead of
+    /// signalling the process directly. Useful for thin CLI wrappers that
+    /// delegate to a daemon (e.g. `docker compose up`).
+    pub shutdown: Option<ShutdownConfig>,
+}
+
+/// Shutdown hook configuration for a service.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ShutdownConfig {
+    /// Command to run to stop the service.
+    pub command: String,
+    /// How long to wait for the main process to exit after the command runs.
+    /// Falls back to signal/kill if the process is still alive. e.g. "30s", "2m".
+    #[serde(default = "default_shutdown_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub timeout: Duration,
+}
+
+fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

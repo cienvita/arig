@@ -84,6 +84,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(String::from).collect(),
             ready: None,
             timeout: None,
+            shutdown: None,
         }
     }
 

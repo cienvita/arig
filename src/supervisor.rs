@@ -45,6 +45,13 @@ macro_rules! event {
     }};
 }
 
+struct ResolvedShutdown {
+    command: String,
+    timeout: std::time::Duration,
+    working_dir: Option<String>,
+    env: std::collections::HashMap<String, String>,
+}
+
 struct ManagedChild {
     name: String,
     wave: usize,
@@ -52,6 +59,7 @@ struct ManagedChild {
     tail: LogTail,
     last_output: LastOutput,
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_hook: Option<ResolvedShutdown>,
 }
 
 struct IpcCleanup(ipc::Endpoint);
@@ -116,6 +124,12 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
             let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
             let io_tasks = pipe_output(&mut child, name, &tail, &log_file, &last_output);
 
+            let shutdown_hook = service.shutdown.as_ref().map(|sd| ResolvedShutdown {
+                command: sd.command.clone(),
+                timeout: sd.timeout,
+                working_dir: service.working_dir.clone(),
+                env: service.env.clone(),
+            });
             let managed = ManagedChild {
                 name: name.clone(),
                 wave: wave_idx,
@@ -123,6 +137,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
                 tail,
                 last_output,
                 io_tasks,
+                shutdown_hook,
             };
 
             state.lock().unwrap().push(protocol::ServiceSnapshot {
@@ -664,9 +679,9 @@ fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::p
 
 async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
     // Walk waves in reverse: dependents first, then their dependencies. Within
-    // each wave, signal everyone, then wait for the whole wave to settle before
-    // moving on. This stops api logging "nats disconnected" while we're still
-    // taking nats down.
+    // each wave, signal everyone without a shutdown hook first (so they start
+    // their graceful exit while we wait on hook-based services), then wait for
+    // the whole wave to settle before moving on.
     let max_wave = children.iter().map(|c| c.wave).max().unwrap_or(0);
 
     for wave_idx in (0..=max_wave).rev() {
@@ -678,22 +693,111 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
             continue;
         }
 
+        // Pre-signal services that don't have a shutdown hook so they can
+        // begin exiting while we sequentially handle hook-based ones.
         for &i in &wave_indices {
-            send_shutdown_signal(&children[i].child);
+            if children[i].shutdown_hook.is_none() {
+                send_shutdown_signal(&children[i].child);
+            }
         }
 
         for &i in &wave_indices {
             let managed = &mut children[i];
-            let graceful =
-                tokio::time::timeout(std::time::Duration::from_secs(5), managed.child.wait()).await;
+            let name = managed.name.clone();
 
-            match graceful {
-                Ok(Ok(status)) => {
-                    event!("arig: {} stopped ({status})", managed.name);
+            // Clone hook data eagerly to avoid holding a shared borrow of
+            // `managed` while we also need &mut access to `managed.child`.
+            let hook = managed.shutdown_hook.as_ref().map(|h| {
+                (
+                    h.command.clone(),
+                    h.timeout,
+                    h.working_dir.clone(),
+                    h.env.clone(),
+                )
+            });
+
+            if let Some((command, timeout, working_dir, env)) = hook {
+                let mut sd_cmd = Command::new(shell_program());
+                sd_cmd
+                    .args(shell_args(&command))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if let Some(ref dir) = working_dir {
+                    sd_cmd.current_dir(dir);
                 }
-                _ => {
-                    event!("arig: {} did not stop in time, force killing", managed.name);
-                    let _ = managed.child.kill().await;
+                sd_cmd.envs(&env);
+                #[cfg(windows)]
+                win::configure_child(&mut sd_cmd);
+                #[cfg(unix)]
+                unix::configure_child(&mut sd_cmd);
+
+                event!("arig: running shutdown hook for '{name}'");
+                match sd_cmd.spawn() {
+                    Ok(mut sd_child) => {
+                        let r = tokio::time::timeout(timeout, managed.child.wait()).await;
+                        // Kill the hook's whole process group, then reap it so
+                        // it doesn't become a zombie and its subprocesses don't
+                        // become orphans.
+                        if let Some(pid) = sd_child.id() {
+                            #[cfg(unix)]
+                            unix::send_sigkill(pid);
+                        }
+                        let _ = sd_child.kill().await;
+                        let _ = sd_child.wait().await;
+                        match r {
+                            Ok(Ok(status)) => event!("arig: {name} stopped ({status})"),
+                            _ => {
+                                // Hook ran but the main child did not exit within
+                                // the configured timeout. Give it a SIGTERM + 5 s
+                                // grace period before force-killing.
+                                event!(
+                                    "arig: {name} did not stop after shutdown hook, signalling"
+                                );
+                                send_shutdown_signal(&managed.child);
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    managed.child.wait(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(status)) => event!("arig: {name} stopped ({status})"),
+                                    _ => {
+                                        event!("arig: {name} did not stop in time, force killing");
+                                        let _ = managed.child.kill().await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        event!(
+                            "arig: shutdown hook for '{name}' failed to spawn ({e}), signalling"
+                        );
+                        send_shutdown_signal(&managed.child);
+                        // Use the configured hook timeout, not the hardcoded
+                        // default, since the operator set it expecting the service
+                        // to need that long to stop.
+                        match tokio::time::timeout(timeout, managed.child.wait()).await {
+                            Ok(Ok(status)) => event!("arig: {name} stopped ({status})"),
+                            _ => {
+                                event!("arig: {name} did not stop in time, force killing");
+                                let _ = managed.child.kill().await;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    managed.child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => event!("arig: {name} stopped ({status})"),
+                    _ => {
+                        event!("arig: {name} did not stop in time, force killing");
+                        let _ = managed.child.kill().await;
+                    }
                 }
             }
 
@@ -837,6 +941,12 @@ mod unix {
         unsafe {
             // Signal the whole process group
             libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+    }
+
+    pub fn send_sigkill(pid: u32) {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
 }
