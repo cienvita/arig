@@ -87,6 +87,17 @@
             }
           ]
         },
+        "shutdown": {
+          "description": "Optional shutdown hook. When present, this command is run instead of\nsignalling the process directly. Useful for thin CLI wrappers that\ndelegate to a daemon (e.g. `docker compose up`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShutdownConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "timeout": {
           "description": "Maximum time a oneshot may run before it's killed and the wave fails.\nIgnored for long-running services. e.g. \"5m\", \"30s\". No default: opt-in.",
           "type": [
@@ -123,6 +134,24 @@
           "type": "string",
           "const": "oneshot"
         }
+      ]
+    },
+    "ShutdownConfig": {
+      "description": "Shutdown hook configuration for a service.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Command to run to stop the service.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "How long to wait for the main process to exit after the command runs.\nFalls back to signal/kill if the process is still alive. e.g. \"30s\", \"2m\".",
+          "type": "string",
+          "default": "30s"
+        }
+      },
+      "required": [
+        "command"
       ]
     }
   }
