@@ -737,9 +737,10 @@ async fn shutdown(children: &mut [ManagedChild], skip_idx: Option<usize>) {
                         let r = tokio::time::timeout(timeout, managed.child.wait()).await;
                         // Kill the hook's whole process group, then reap it so
                         // it doesn't become a zombie and its subprocesses don't
-                        // become orphans.
+                        // become orphans. On Windows the job object owns the
+                        // tree, so the kill below covers it.
+                        #[cfg(unix)]
                         if let Some(pid) = sd_child.id() {
-                            #[cfg(unix)]
                             unix::send_sigkill(pid);
                         }
                         let _ = sd_child.kill().await;
