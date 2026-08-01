@@ -660,6 +660,14 @@ fn spawn_service(name: &str, service: &ServiceConfig) -> anyhow::Result<tokio::p
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Oneshots get an empty stdin. A command that prompts sees EOF and takes
+    // its non-interactive path (or fails loudly) instead of blocking on a read
+    // that never resolves and stalling the wave. Long-running services keep the
+    // inherited stdin, since the foreground service may legitimately want it.
+    if service.service_type == ServiceType::Oneshot {
+        cmd.stdin(Stdio::null());
+    }
+
     if let Some(dir) = &service.working_dir {
         cmd.current_dir(dir);
     }
@@ -943,5 +951,44 @@ mod unix {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn svc(command: &str, service_type: ServiceType) -> ServiceConfig {
+        ServiceConfig {
+            command: command.to_string(),
+            service_type,
+            working_dir: None,
+            env: HashMap::new(),
+            depends_on: Vec::new(),
+            ready: None,
+            timeout: None,
+            shutdown: None,
+        }
+    }
+
+    // A command that blocks on stdin until it sees EOF. `cat` copies stdin to
+    // stdout; `set /p` is a cmd builtin that reads one line, chosen over `more`
+    // because the pager waits on the console even when stdin is redirected.
+    fn stdin_reader() -> &'static str {
+        if cfg!(windows) { "set /p X=" } else { "cat" }
+    }
+
+    #[tokio::test]
+    async fn oneshot_stdin_is_closed() {
+        let mut child = spawn_service("reader", &svc(stdin_reader(), ServiceType::Oneshot))
+            .expect("spawn oneshot");
+
+        // The regression is a hang, so the assertion is that it terminates at
+        // all. Exit status is up to the command's own EOF handling.
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("oneshot stdin should be at EOF, not waiting on the terminal")
+            .expect("wait on oneshot");
     }
 }
