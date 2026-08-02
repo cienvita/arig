@@ -1,8 +1,10 @@
 mod client;
 mod config;
 mod dag;
+mod event;
 mod ipc;
 mod protocol;
+mod state;
 mod supervisor;
 
 use clap::{Parser, Subcommand};
