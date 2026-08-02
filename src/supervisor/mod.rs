@@ -1,4 +1,5 @@
 mod logs;
+mod platform;
 mod process;
 
 use crate::config::{ArigConfig, ReadyProbe, ServiceType};
@@ -60,7 +61,7 @@ struct Kernel {
 
 pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     #[cfg(windows)]
-    let _job = process::win::JobGuard::new()?;
+    let _job = platform::win::JobGuard::new()?;
 
     let bus = Bus::new(crate::event::CAPACITY);
 
@@ -377,7 +378,7 @@ pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let child = process::spawn_detached(&mut cmd)?;
+    let child = platform::spawn_detached(&mut cmd)?;
     let pid = child.id();
     eprintln!("arig: spawned supervisor (pid {pid})");
 
