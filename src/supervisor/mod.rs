@@ -608,3 +608,215 @@ fn stopped(bus: &Bus, name: &str, status: &str) {
         status: status.to_string(),
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DirsConfig, ServiceConfig};
+    use crate::runtime::{Runtime, SpawnedService};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::process::ExitStatus;
+    use tokio::sync::broadcast::error::RecvError;
+
+    /// What the kernel asked of the services, in the order it asked.
+    #[derive(Clone, Default)]
+    struct StopLog(Arc<Mutex<Vec<String>>>);
+
+    impl StopLog {
+        fn record(&self, entry: String) {
+            self.0.lock().expect("stop log mutex poisoned").push(entry);
+        }
+
+        fn entries(&self) -> Vec<String> {
+            self.0.lock().expect("stop log mutex poisoned").clone()
+        }
+    }
+
+    /// Stands in for a real runtime so the wave and shutdown ordering can be
+    /// tested without spawning anything.
+    struct FakeRuntime {
+        log: StopLog,
+        force_kill: bool,
+    }
+
+    #[async_trait]
+    impl Runtime for FakeRuntime {
+        // Registered under the default name, since that is what services
+        // resolve to.
+        fn name(&self) -> &'static str {
+            DEFAULT_RUNTIME
+        }
+
+        async fn spawn(&self, name: &str, _spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
+            Ok(SpawnedService {
+                handle: Box::new(FakeService {
+                    name: name.to_string(),
+                    log: self.log.clone(),
+                    force_kill: self.force_kill,
+                }),
+                stdout: None,
+                stderr: None,
+            })
+        }
+    }
+
+    struct FakeService {
+        name: String,
+        log: StopLog,
+        force_kill: bool,
+    }
+
+    #[async_trait]
+    impl RunningService for FakeService {
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+
+        async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
+            // Long-running: nothing but shutdown ends this.
+            std::future::pending().await
+        }
+
+        fn begin_stop(&mut self) {
+            self.log.record(format!("begin {}", self.name));
+        }
+
+        async fn finish_stop(&mut self) -> StopOutcome {
+            self.log.record(format!("finish {}", self.name));
+            if self.force_kill {
+                StopOutcome::Killed
+            } else {
+                StopOutcome::Exited(exit_success())
+            }
+        }
+
+        async fn kill(&mut self) {
+            self.log.record(format!("kill {}", self.name));
+        }
+    }
+
+    fn exit_success() -> ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatusExt::from_raw(0)
+    }
+
+    fn service(depends_on: &[&str]) -> ServiceConfig {
+        ServiceConfig {
+            command: "never run: the fake runtime ignores it".to_string(),
+            service_type: ServiceType::Service,
+            working_dir: None,
+            env: HashMap::new(),
+            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            ready: None,
+            timeout: None,
+            shutdown: None,
+        }
+    }
+
+    fn session_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arig-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run the kernel over `services`, ask it to shut down once they are all
+    /// up, and report what the runtime saw and what reached the bus.
+    async fn run_to_shutdown(
+        tag: &str,
+        services: &[(&str, &[&str])],
+        force_kill: bool,
+    ) -> (Vec<String>, Vec<Event>) {
+        let bus = Bus::new(64);
+        let mut collected = bus.subscribe();
+        let mut starts = bus.subscribe();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let log = StopLog::default();
+
+        let mut registry = Registry::default();
+        registry.register(Arc::new(FakeRuntime {
+            log: log.clone(),
+            force_kill,
+        }));
+
+        let kernel = Kernel {
+            config: ArigConfig {
+                dirs: DirsConfig::default(),
+                services: services
+                    .iter()
+                    .map(|(name, deps)| (name.to_string(), service(deps)))
+                    .collect(),
+            },
+            bus: bus.clone(),
+            session_dir: session_dir(tag),
+            shutdown_rx,
+            registry,
+        };
+
+        let expected = services.len();
+        let trigger = tokio::spawn(async move {
+            let mut seen = 0;
+            while seen < expected {
+                match starts.recv().await {
+                    Ok(Event::ServiceStarted { .. }) => seen += 1,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        });
+
+        kernel.run().await.expect("kernel run");
+        trigger.await.expect("trigger task");
+
+        let mut events = Vec::new();
+        while let Ok(event) = collected.try_recv() {
+            events.push(event);
+        }
+        let _ = std::fs::remove_dir_all(session_dir(tag));
+        (log.entries(), events)
+    }
+
+    #[tokio::test]
+    async fn services_stop_in_reverse_wave_order() {
+        let (stops, _) =
+            run_to_shutdown("reverse-waves", &[("db", &[]), ("api", &["db"])], false).await;
+
+        assert_eq!(stops, ["begin api", "finish api", "begin db", "finish db"]);
+    }
+
+    #[tokio::test]
+    async fn a_whole_wave_is_signalled_before_any_of_it_is_waited_on() {
+        let (stops, _) = run_to_shutdown("one-wave", &[("a", &[]), ("b", &[])], false).await;
+
+        // Which of the two goes first follows config iteration order, so the
+        // claim is about the split between signalling and waiting.
+        assert_eq!(stops.len(), 4, "got: {stops:?}");
+        assert!(
+            stops[..2].iter().all(|s| s.starts_with("begin")),
+            "got: {stops:?}"
+        );
+        assert!(
+            stops[2..].iter().all(|s| s.starts_with("finish")),
+            "got: {stops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_the_runtime_had_to_kill_is_reported_as_killed() {
+        let (_, events) = run_to_shutdown("killed", &[("a", &[])], true).await;
+
+        let exits: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ServiceExited { name, status } => Some((name.as_str(), status.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits, [("a", "killed")]);
+    }
+}
