@@ -9,13 +9,14 @@ use crate::probe::ReadyCheck;
 use crate::protocol;
 use crate::registry::{BoundProbe, DEFAULT_RUNTIME, Registry};
 use crate::runtime::{RunningService, StopOutcome};
+use crate::sink;
 use crate::state::{self, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
 use logs::{LastOutput, LogTail};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,7 +58,6 @@ impl Drop for IpcCleanup {
 struct Kernel {
     config: ArigConfig,
     bus: Bus,
-    session_dir: PathBuf,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     registry: Registry,
 }
@@ -86,10 +86,11 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         });
     }
 
-    let session_dir = logs::create_session_dir(&config.dirs.logs)?;
-    // Subscribe the sinks before the first line is emitted; anything emitted
-    // earlier is gone by the time they attach.
-    let session_log = logs::SessionLog::spawn(&bus, logs::open_log_file(&session_dir, "_arig")?);
+    let session_dir = sink::file::create_session_dir(&config.dirs.logs)?;
+    let mut registry = Registry::with_builtins(&bus, &session_dir);
+    // Attach the sinks before the first line is emitted; anything emitted
+    // earlier is gone by the time they subscribe.
+    let sinks = sink::spawn(&bus, registry.take_sinks());
     let state = state::spawn(&bus);
     event!(bus, "arig: logs at {}", session_dir.display());
 
@@ -109,15 +110,14 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let kernel = Kernel {
         config,
         bus: bus.clone(),
-        session_dir,
         shutdown_rx,
-        registry: Registry::with_builtins(&bus),
+        registry,
     };
     let result = kernel.run().await;
 
-    // The session log is a task of its own, so give it a moment to write the
+    // The sinks run in a task of their own, so give them a moment to write the
     // lines emitted just before we return.
-    bus.drain(session_log.cursor(), IO_DRAIN_TIMEOUT).await;
+    bus.drain(&sinks, IO_DRAIN_TIMEOUT).await;
     result
 }
 
@@ -167,10 +167,9 @@ impl Kernel {
                 event!(self.bus, "arig: started {name} (PID {pid})");
 
                 let tail = logs::new_tail();
-                let log_file = logs::open_log_file(&self.session_dir, name)?;
                 let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
                 let io_tasks =
-                    logs::pipe_output(&mut spawned, name, &tail, &log_file, &last_output);
+                    logs::pipe_output(&mut spawned, name, &tail, &last_output, &self.bus);
 
                 let managed = ManagedChild {
                     name: name.clone(),
@@ -804,18 +803,10 @@ mod tests {
         }
     }
 
-    fn session_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("arig-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// Run the kernel over `services`, ask it to shut down once they are all
     /// up, and report what the runtime saw and what reached the bus. With a
     /// `probe`, every service gets a readiness block for it to answer.
     async fn run_to_shutdown(
-        tag: &str,
         services: &[(&str, &[&str])],
         force_kill: bool,
         probe: Option<Arc<dyn Probe>>,
@@ -845,7 +836,6 @@ mod tests {
                     .collect(),
             },
             bus: bus.clone(),
-            session_dir: session_dir(tag),
             shutdown_rx,
             registry,
         };
@@ -870,26 +860,19 @@ mod tests {
         while let Ok(event) = collected.try_recv() {
             events.push(event);
         }
-        let _ = std::fs::remove_dir_all(session_dir(tag));
         (log.entries(), events)
     }
 
     #[tokio::test]
     async fn services_stop_in_reverse_wave_order() {
-        let (stops, _) = run_to_shutdown(
-            "reverse-waves",
-            &[("db", &[]), ("api", &["db"])],
-            false,
-            None,
-        )
-        .await;
+        let (stops, _) = run_to_shutdown(&[("db", &[]), ("api", &["db"])], false, None).await;
 
         assert_eq!(stops, ["begin api", "finish api", "begin db", "finish db"]);
     }
 
     #[tokio::test]
     async fn a_whole_wave_is_signalled_before_any_of_it_is_waited_on() {
-        let (stops, _) = run_to_shutdown("one-wave", &[("a", &[]), ("b", &[])], false, None).await;
+        let (stops, _) = run_to_shutdown(&[("a", &[]), ("b", &[])], false, None).await;
 
         // Which of the two goes first follows config iteration order, so the
         // claim is about the split between signalling and waiting.
@@ -906,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_service_the_runtime_had_to_kill_is_reported_as_killed() {
-        let (_, events) = run_to_shutdown("killed", &[("a", &[])], true, None).await;
+        let (_, events) = run_to_shutdown(&[("a", &[])], true, None).await;
 
         let exits: Vec<_> = events
             .iter()
@@ -921,7 +904,6 @@ mod tests {
     #[tokio::test]
     async fn a_wave_waits_on_the_probe_the_registry_resolved() {
         let (_, events) = run_to_shutdown(
-            "probe-passes",
             &[("db", &[]), ("api", &["db"])],
             false,
             Some(Arc::new(FakeProbe { passes: true })),
@@ -959,7 +941,6 @@ mod tests {
                 services: [("api".to_string(), service(&[], Some(ready_block())))].into(),
             },
             bus,
-            session_dir: session_dir("probe-fails"),
             shutdown_rx,
             registry,
         };
@@ -974,7 +955,5 @@ mod tests {
         );
         // The service that never came up is still stopped on the way out.
         assert_eq!(log.entries(), ["begin api", "finish api"]);
-
-        let _ = std::fs::remove_dir_all(session_dir("probe-fails"));
     }
 }

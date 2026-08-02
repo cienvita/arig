@@ -7,6 +7,7 @@ mod probe;
 mod protocol;
 mod registry;
 mod runtime;
+mod sink;
 mod state;
 mod supervisor;
 

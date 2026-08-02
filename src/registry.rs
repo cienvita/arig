@@ -7,7 +7,11 @@ use crate::probe::tcp::TcpProbe;
 use crate::probe::{Probe, ReadyCheck};
 use crate::runtime::Runtime;
 use crate::runtime::process::ProcessRuntime;
+use crate::sink::LogSink;
+use crate::sink::console::ConsoleSink;
+use crate::sink::file::FileSink;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// The runtime a service runs on when it does not ask for another. Nothing in
@@ -25,13 +29,20 @@ pub struct BoundProbe {
 pub struct Registry {
     runtimes: HashMap<&'static str, Arc<dyn Runtime>>,
     probes: HashMap<&'static str, Arc<dyn Probe>>,
+    /// Not keyed by name: nothing selects a sink, they all see everything.
+    sinks: Vec<Box<dyn LogSink>>,
 }
 
 impl Registry {
-    pub fn with_builtins(bus: &Bus) -> Self {
+    pub fn with_builtins(bus: &Bus, session_dir: &Path) -> Self {
         let mut registry = Self::default();
         registry.register(Arc::new(ProcessRuntime::new(bus.clone())));
         registry.register_probe(Arc::new(TcpProbe));
+        registry.register_sink(Box::new(ConsoleSink));
+        registry.register_sink(Box::new(FileSink::new(
+            session_dir.to_path_buf(),
+            bus.clone(),
+        )));
         registry
     }
 
@@ -41,6 +52,16 @@ impl Registry {
 
     pub fn register_probe(&mut self, probe: Arc<dyn Probe>) {
         self.probes.insert(probe.name(), probe);
+    }
+
+    pub fn register_sink(&mut self, sink: Box<dyn LogSink>) {
+        self.sinks.push(sink);
+    }
+
+    /// Hand the sinks to the task that will drive them. They are stateful and
+    /// owned by that task, so the registry keeps them only until it starts.
+    pub fn take_sinks(&mut self) -> Vec<Box<dyn LogSink>> {
+        std::mem::take(&mut self.sinks)
     }
 
     pub fn runtime(&self, name: &str) -> anyhow::Result<&Arc<dyn Runtime>> {
@@ -78,9 +99,14 @@ impl Registry {
 mod tests {
     use super::*;
 
+    /// The sinks are never driven here, so the directory is never touched.
+    fn builtins() -> Registry {
+        Registry::with_builtins(&Bus::new(1), Path::new("."))
+    }
+
     #[test]
     fn builtins_include_the_process_runtime() {
-        let registry = Registry::with_builtins(&Bus::new(1));
+        let registry = builtins();
         assert!(registry.runtime(DEFAULT_RUNTIME).is_ok());
     }
 
@@ -119,7 +145,7 @@ mod tests {
 
     #[test]
     fn a_tcp_block_resolves_to_the_tcp_probe() {
-        let bound = Registry::with_builtins(&Bus::new(1))
+        let bound = builtins()
             .ready_check(&spec(Some("127.0.0.1:5432")))
             .expect("resolve")
             .expect("a tcp address selects a probe");
@@ -130,7 +156,7 @@ mod tests {
 
     #[test]
     fn a_block_that_names_no_probe_resolves_to_nothing() {
-        let bound = Registry::with_builtins(&Bus::new(1))
+        let bound = builtins()
             .ready_check(&spec(None))
             .expect("an empty ready block is allowed");
 
@@ -139,7 +165,7 @@ mod tests {
 
     #[test]
     fn a_block_two_probes_claim_is_rejected() {
-        let mut registry = Registry::with_builtins(&Bus::new(1));
+        let mut registry = builtins();
         registry.register_probe(Arc::new(GreedyProbe));
 
         let err = registry
