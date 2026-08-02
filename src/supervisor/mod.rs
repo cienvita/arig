@@ -1,12 +1,12 @@
 mod logs;
 mod platform;
-mod process;
 
 use crate::config::{ArigConfig, ReadyProbe, ServiceType};
 use crate::dag;
 use crate::event::{Bus, Event, ServiceKind, event};
 use crate::ipc;
 use crate::protocol;
+use crate::runtime::{RunningService, Runtime, StopOutcome, process::ProcessRuntime};
 use crate::state::{self, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
@@ -17,7 +17,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::process::Command;
 use tokio::signal;
 
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -25,21 +24,15 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-struct ResolvedShutdown {
-    command: String,
-    timeout: Duration,
-    working_dir: Option<String>,
-    env: std::collections::HashMap<String, String>,
-}
-
+/// A service the kernel is responsible for: the runtime's handle on it, plus
+/// the log plumbing the kernel set up around it.
 struct ManagedChild {
     name: String,
     wave: usize,
-    child: tokio::process::Child,
+    handle: Box<dyn RunningService>,
     tail: LogTail,
     last_output: LastOutput,
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
-    shutdown_hook: Option<ResolvedShutdown>,
 }
 
 struct IpcCleanup(ipc::Endpoint);
@@ -51,12 +44,14 @@ impl Drop for IpcCleanup {
 }
 
 /// Owns everything the supervisor needs to drive services: the config, the DAG
-/// it came from, and the bus every observer hangs off.
+/// it came from, the bus every observer hangs off, and the runtime that does
+/// the actual spawning.
 struct Kernel {
     config: ArigConfig,
     bus: Bus,
     session_dir: PathBuf,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    runtime: Box<dyn Runtime>,
 }
 
 pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
@@ -108,6 +103,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         bus: bus.clone(),
         session_dir,
         shutdown_rx,
+        runtime: Box::new(ProcessRuntime::new(bus.clone())),
     };
     let result = kernel.run().await;
 
@@ -128,30 +124,23 @@ impl Kernel {
 
             for name in wave {
                 let service = &self.config.services[name];
-                let mut child = process::spawn_service(service)?;
-                let pid = child.id().unwrap_or(0);
+                let mut spawned = self.runtime.spawn(name, service).await?;
+                let pid = spawned.handle.pid().unwrap_or(0);
                 event!(self.bus, "arig: started {name} (PID {pid})");
 
                 let tail = logs::new_tail();
                 let log_file = logs::open_log_file(&self.session_dir, name)?;
                 let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
                 let io_tasks =
-                    process::pipe_output(&mut child, name, &tail, &log_file, &last_output);
+                    logs::pipe_output(&mut spawned, name, &tail, &log_file, &last_output);
 
-                let shutdown_hook = service.shutdown.as_ref().map(|sd| ResolvedShutdown {
-                    command: sd.command.clone(),
-                    timeout: sd.timeout,
-                    working_dir: service.working_dir.clone(),
-                    env: service.env.clone(),
-                });
                 let managed = ManagedChild {
                     name: name.clone(),
                     wave: wave_idx,
-                    child,
+                    handle: spawned.handle,
                     tail,
                     last_output,
                     io_tasks,
-                    shutdown_hook,
                 };
 
                 self.bus.emit(Event::ServiceStarted {
@@ -178,7 +167,7 @@ impl Kernel {
                 let wait = wait_oneshot(
                     &self.bus,
                     &managed.name,
-                    &mut managed.child,
+                    managed.handle.as_mut(),
                     timeout,
                     managed.last_output.clone(),
                 );
@@ -273,7 +262,7 @@ impl Kernel {
                 .enumerate()
                 .map(|(i, c)| {
                     Box::pin(async move {
-                        let status = c.child.wait().await;
+                        let status = c.handle.wait().await;
                         (i, status)
                     })
                 })
@@ -470,7 +459,7 @@ fn dump_tail(bus: &Bus, name: &str, tail: &LogTail) {
 async fn wait_oneshot(
     bus: &Bus,
     name: &str,
-    child: &mut tokio::process::Child,
+    handle: &mut dyn RunningService,
     timeout: Option<Duration>,
     last_output: LastOutput,
 ) -> anyhow::Result<std::process::ExitStatus> {
@@ -479,25 +468,24 @@ async fn wait_oneshot(
         name.to_string(),
         last_output,
     ));
-    let result = wait_oneshot_inner(name, child, timeout).await;
+    let result = wait_oneshot_inner(name, handle, timeout).await;
     heartbeat.abort();
     result
 }
 
 async fn wait_oneshot_inner(
     name: &str,
-    child: &mut tokio::process::Child,
+    handle: &mut dyn RunningService,
     timeout: Option<Duration>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let Some(limit) = timeout else {
-        return Ok(child.wait().await?);
+        return handle.wait().await;
     };
 
-    match tokio::time::timeout(limit, child.wait()).await {
-        Ok(status) => Ok(status?),
+    match tokio::time::timeout(limit, handle.wait()).await {
+        Ok(status) => status,
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            handle.kill().await;
             anyhow::bail!(
                 "oneshot '{name}' timed out after {}",
                 humantime::format_duration(limit)
@@ -585,98 +573,24 @@ async fn shutdown(bus: &Bus, children: &mut [ManagedChild], skip_idx: Option<usi
             continue;
         }
 
-        // Pre-signal services that don't have a shutdown hook so they can
-        // begin exiting while we sequentially handle hook-based ones.
+        // Set the whole wave on its way out before waiting on any one of them,
+        // so services that stop on a signal do so while we are still waiting
+        // for the ones that need a shutdown hook.
         for &i in &wave_indices {
-            if children[i].shutdown_hook.is_none() {
-                process::send_shutdown_signal(&children[i].child);
-            }
+            children[i].handle.begin_stop();
         }
 
         for &i in &wave_indices {
             let managed = &mut children[i];
             let name = managed.name.clone();
 
-            // Clone hook data eagerly to avoid holding a shared borrow of
-            // `managed` while we also need &mut access to `managed.child`.
-            let hook = managed.shutdown_hook.as_ref().map(|h| {
-                (
-                    h.command.clone(),
-                    h.timeout,
-                    h.working_dir.clone(),
-                    h.env.clone(),
-                )
-            });
-
-            if let Some((command, timeout, working_dir, env)) = hook {
-                let mut sd_cmd = Command::new(process::shell_program());
-                sd_cmd
-                    .args(process::shell_args(&command))
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                if let Some(ref dir) = working_dir {
-                    sd_cmd.current_dir(dir);
-                }
-                sd_cmd.envs(&env);
-                process::configure_child(&mut sd_cmd);
-
-                event!(bus, "arig: running shutdown hook for '{name}'");
-                match sd_cmd.spawn() {
-                    Ok(mut sd_child) => {
-                        let r = tokio::time::timeout(timeout, managed.child.wait()).await;
-                        // Kill the hook's whole process group, then reap it so
-                        // it doesn't become a zombie and its subprocesses don't
-                        // become orphans. On Windows the job object owns the
-                        // tree, so the kill below covers it.
-                        if let Some(pid) = sd_child.id() {
-                            process::kill_process_group(pid);
-                        }
-                        let _ = sd_child.kill().await;
-                        let _ = sd_child.wait().await;
-                        match r {
-                            Ok(Ok(status)) => stopped(bus, &name, &status.to_string()),
-                            _ => {
-                                // Hook ran but the main child did not exit within
-                                // the configured timeout. Give it a SIGTERM + 5 s
-                                // grace period before force-killing.
-                                event!(
-                                    bus,
-                                    "arig: {name} did not stop after shutdown hook, signalling"
-                                );
-                                process::send_shutdown_signal(&managed.child);
-                                match tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    managed.child.wait(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(status)) => stopped(bus, &name, &status.to_string()),
-                                    _ => {
-                                        force_kill(bus, &name, &mut managed.child).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        event!(
-                            bus,
-                            "arig: shutdown hook for '{name}' failed to spawn ({e}), signalling"
-                        );
-                        process::send_shutdown_signal(&managed.child);
-                        // Use the configured hook timeout, not the hardcoded
-                        // default, since the operator set it expecting the service
-                        // to need that long to stop.
-                        match tokio::time::timeout(timeout, managed.child.wait()).await {
-                            Ok(Ok(status)) => stopped(bus, &name, &status.to_string()),
-                            _ => force_kill(bus, &name, &mut managed.child).await,
-                        }
-                    }
-                }
-            } else {
-                match tokio::time::timeout(Duration::from_secs(5), managed.child.wait()).await {
-                    Ok(Ok(status)) => stopped(bus, &name, &status.to_string()),
-                    _ => force_kill(bus, &name, &mut managed.child).await,
+            match managed.handle.finish_stop().await {
+                StopOutcome::Exited(status) => stopped(bus, &name, &status.to_string()),
+                StopOutcome::Killed => {
+                    bus.emit(Event::ServiceExited {
+                        name,
+                        status: "killed".to_string(),
+                    });
                 }
             }
 
@@ -690,14 +604,5 @@ fn stopped(bus: &Bus, name: &str, status: &str) {
     bus.emit(Event::ServiceExited {
         name: name.to_string(),
         status: status.to_string(),
-    });
-}
-
-async fn force_kill(bus: &Bus, name: &str, child: &mut tokio::process::Child) {
-    event!(bus, "arig: {name} did not stop in time, force killing");
-    let _ = child.kill().await;
-    bus.emit(Event::ServiceExited {
-        name: name.to_string(),
-        status: "killed".to_string(),
     });
 }

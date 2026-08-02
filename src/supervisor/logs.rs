@@ -1,4 +1,5 @@
 use crate::event::{Bus, Cursor, Event};
+use crate::runtime::SpawnedService;
 use chrono::Local;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -6,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 
 pub const TAIL_LINES: usize = 50;
@@ -79,6 +81,49 @@ pub fn mark_output(last_output: &LastOutput) {
     if let Ok(mut t) = last_output.lock() {
         *t = Instant::now();
     }
+}
+
+/// Read a service's stdout and stderr line by line, fanning each line out to
+/// the console, the service's log file, and its tail ring.
+pub fn pipe_output(
+    spawned: &mut SpawnedService,
+    name: &str,
+    tail: &LogTail,
+    log_file: &LogFile,
+    last_output: &LastOutput,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    if let Some(stdout) = spawned.stdout.take() {
+        let n = name.to_string();
+        let t = tail.clone();
+        let f = log_file.clone();
+        let lo = last_output.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                println!("[{n}] {line}");
+                write_log_line(&f, &line);
+                push_tail(&t, line);
+                mark_output(&lo);
+            }
+        }));
+    }
+    if let Some(stderr) = spawned.stderr.take() {
+        let n = name.to_string();
+        let t = tail.clone();
+        let f = log_file.clone();
+        let lo = last_output.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[{n}] {line}");
+                write_log_line(&f, &line);
+                push_tail(&t, line);
+                mark_output(&lo);
+            }
+        }));
+    }
+    tasks
 }
 
 /// Session-wide `_arig.log`: a subscriber that writes every `arig: ...` line
