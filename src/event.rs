@@ -37,9 +37,16 @@ impl From<&ServiceType> for ServiceKind {
     }
 }
 
-/// What the supervisor observes. Variants land here as their consumers do:
-/// service output (`LogLine`) and readiness follow with the log sinks, since a
-/// variant nothing reads is dead code under `-D warnings`.
+/// Which of a service's streams a line came from. Sinks that separate the two
+/// (the console) need it; ones that interleave them (the log files) don't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// What the supervisor observes. Variants land here as their consumers do,
+/// since a variant nothing reads is dead code under `-D warnings`.
 #[derive(Debug, Clone)]
 pub enum Event {
     ServiceStarted {
@@ -55,6 +62,12 @@ pub enum Event {
     ServiceExited {
         name: String,
         status: String,
+    },
+    /// One line a service wrote.
+    LogLine {
+        service: String,
+        stream: Stream,
+        line: String,
     },
     /// One of arig's own `arig: ...` lines.
     Supervisor {
@@ -92,10 +105,9 @@ impl Bus {
         let _ = self.tx.send(event);
     }
 
-    /// Emit one of arig's own lines. The console write stays direct here and
-    /// becomes a sink later; the bus copy is what reaches the session log.
+    /// Emit one of arig's own lines. Where it ends up - terminal, session log,
+    /// both - is entirely up to the sinks attached to the bus.
     pub fn supervisor(&self, line: String) {
-        eprintln!("{line}");
         self.emit(Event::Supervisor { line });
     }
 
