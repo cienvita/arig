@@ -4,6 +4,7 @@ mod dag;
 mod event;
 mod ipc;
 mod protocol;
+mod registry;
 mod runtime;
 mod state;
 mod supervisor;

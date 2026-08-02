@@ -6,7 +6,8 @@ use crate::dag;
 use crate::event::{Bus, Event, ServiceKind, event};
 use crate::ipc;
 use crate::protocol;
-use crate::runtime::{RunningService, Runtime, StopOutcome, process::ProcessRuntime};
+use crate::registry::{DEFAULT_RUNTIME, Registry};
+use crate::runtime::{RunningService, StopOutcome};
 use crate::state::{self, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
@@ -44,14 +45,14 @@ impl Drop for IpcCleanup {
 }
 
 /// Owns everything the supervisor needs to drive services: the config, the DAG
-/// it came from, the bus every observer hangs off, and the runtime that does
+/// it came from, the bus every observer hangs off, and the runtimes that do
 /// the actual spawning.
 struct Kernel {
     config: ArigConfig,
     bus: Bus,
     session_dir: PathBuf,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    runtime: Box<dyn Runtime>,
+    registry: Registry,
 }
 
 pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
@@ -103,7 +104,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         bus: bus.clone(),
         session_dir,
         shutdown_rx,
-        runtime: Box::new(ProcessRuntime::new(bus.clone())),
+        registry: Registry::with_builtins(&bus),
     };
     let result = kernel.run().await;
 
@@ -124,7 +125,8 @@ impl Kernel {
 
             for name in wave {
                 let service = &self.config.services[name];
-                let mut spawned = self.runtime.spawn(name, service).await?;
+                let runtime = self.registry.runtime(DEFAULT_RUNTIME)?;
+                let mut spawned = runtime.spawn(name, service).await?;
                 let pid = spawned.handle.pid().unwrap_or(0);
                 event!(self.bus, "arig: started {name} (PID {pid})");
 

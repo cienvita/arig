@@ -9,6 +9,9 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::Command;
 
+/// The name this runtime registers under.
+pub const NAME: &str = "process";
+
 /// How long a service gets to exit after being signalled before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -24,6 +27,10 @@ impl ProcessRuntime {
 
 #[async_trait]
 impl Runtime for ProcessRuntime {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
         let mut child = spawn_child(spec)?;
         let stdout = child.stdout.take().map(|s| Box::new(s) as OutputStream);

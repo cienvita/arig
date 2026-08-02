@@ -30,6 +30,9 @@ pub enum StopOutcome {
 
 #[async_trait]
 pub trait Runtime: Send + Sync {
+    /// The name services select this runtime by, and its key in the registry.
+    fn name(&self) -> &'static str;
+
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService>;
 }
 
