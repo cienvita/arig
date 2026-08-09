@@ -64,7 +64,7 @@ To match the schema to your installed binary instead, generate it locally:
 
 Near-term:
 - [x] `-C dir` flag (chdir before reading config)
-- [ ] Resolve `working_dir` and template paths against the yaml file's directory
+- [x] Resolve `working_dir` against the yaml file's directory
 - [x] TCP health checks with readiness gating
 - [ ] HTTP health checks
 - [ ] Template rendering for `.arig/templates` -> `.arig/generated`

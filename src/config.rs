@@ -157,8 +157,35 @@ impl PortMapping {
 impl ArigConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: ArigConfig = serde_yaml::from_str(&contents)?;
+        let mut config: ArigConfig = serde_yaml::from_str(&contents)?;
+        config.rebase_working_dirs(path.parent().unwrap_or(Path::new("")));
         Ok(config)
+    }
+
+    /// `working_dir` is documented as relative to the config file's directory,
+    /// which is not necessarily where the supervisor runs: `--file` can name a
+    /// config in another directory. Rebase once here so every consumer, the
+    /// spawn path and the shutdown hook alike, sees a resolved value.
+    fn rebase_working_dirs(&mut self, base: &Path) {
+        // An empty base means the config sits in the working directory, so a
+        // relative working_dir already resolves correctly.
+        if base.as_os_str().is_empty() {
+            return;
+        }
+        for service in self.services.values_mut() {
+            let Some(dir) = &service.working_dir else {
+                continue;
+            };
+            let dir = Path::new(dir);
+            if dir.is_relative() {
+                // Collecting the components drops the interior `.` a joined
+                // `./inner` would otherwise leave in the middle of the path,
+                // which only shows up as noise in logs and errors. `..` is
+                // left alone; resolving it here would be wrong across symlinks.
+                let joined: PathBuf = base.join(dir).components().collect();
+                service.working_dir = Some(joined.to_string_lossy().into_owned());
+            }
+        }
     }
 }
 
@@ -187,6 +214,56 @@ mod tests {
         assert_eq!(db.image.as_deref(), Some("postgres:16"));
         assert!(db.command.is_none());
         assert_eq!(db.ports, ["5432:5432"]);
+    }
+
+    #[test]
+    fn working_dir_resolves_against_the_config_directory() {
+        // Regression: `--file` naming a config elsewhere used to leave
+        // working_dir resolving against the invocation directory instead.
+        let dir = std::env::temp_dir().join(format!("arig-test-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("arig.yaml");
+        std::fs::write(
+            &path,
+            "services:\n  a:\n    command: pwd\n    working_dir: ./inner\n",
+        )
+        .expect("write config");
+
+        let config = ArigConfig::load(&path).expect("load");
+
+        assert_eq!(
+            config.services["a"].working_dir.as_deref(),
+            Some(dir.join("inner").to_string_lossy().as_ref()),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absolute_working_dir_is_left_alone() {
+        let absolute = std::env::temp_dir().join("elsewhere");
+        let mut config: ArigConfig = serde_yaml::from_str(&format!(
+            "services:\n  a:\n    command: pwd\n    working_dir: {}\n",
+            absolute.display()
+        ))
+        .expect("parse");
+
+        config.rebase_working_dirs(Path::new("/some/config/dir"));
+
+        assert_eq!(
+            config.services["a"].working_dir.as_deref(),
+            Some(absolute.to_string_lossy().as_ref()),
+        );
+    }
+
+    #[test]
+    fn a_config_in_the_working_directory_leaves_working_dir_alone() {
+        let mut config: ArigConfig =
+            serde_yaml::from_str("services:\n  a:\n    command: pwd\n    working_dir: ./inner\n")
+                .expect("parse");
+
+        config.rebase_working_dirs(Path::new(""));
+
+        assert_eq!(config.services["a"].working_dir.as_deref(), Some("./inner"));
     }
 
     #[test]
