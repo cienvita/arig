@@ -31,6 +31,13 @@ impl Runtime for ProcessRuntime {
         NAME
     }
 
+    fn validate(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<()> {
+        if spec.command.is_none() {
+            anyhow::bail!("service '{name}' has no command");
+        }
+        Ok(())
+    }
+
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
         let mut child = spawn_child(spec)?;
         let stdout = child.stdout.take().map(|s| Box::new(s) as OutputStream);
@@ -172,8 +179,15 @@ impl ProcessChild {
 }
 
 fn spawn_child(service: &ServiceConfig) -> anyhow::Result<tokio::process::Child> {
+    // `validate` has already rejected a service with no command; this keeps
+    // spawn_child honest for callers that skip it.
+    let command = service
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("service has no command"))?;
+
     let mut cmd = Command::new(shell_program());
-    cmd.args(shell_args(&service.command))
+    cmd.args(shell_args(command))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -316,7 +330,10 @@ mod tests {
 
     fn svc(command: &str, service_type: ServiceType) -> ServiceConfig {
         ServiceConfig {
-            command: command.to_string(),
+            runtime: NAME.to_string(),
+            command: Some(command.to_string()),
+            image: None,
+            ports: Vec::new(),
             service_type,
             working_dir: None,
             env: HashMap::new(),
@@ -325,6 +342,18 @@ mod tests {
             timeout: None,
             shutdown: None,
         }
+    }
+
+    #[test]
+    fn a_service_with_no_command_is_rejected_before_it_spawns() {
+        let mut spec = svc("unused", ServiceType::Service);
+        spec.command = None;
+
+        let err = ProcessRuntime::new(Bus::new(1))
+            .validate("api", &spec)
+            .err()
+            .expect("a process service must have a command");
+        assert!(err.to_string().contains("api"), "got: {err}");
     }
 
     // A command that blocks on stdin until it sees EOF. `cat` copies stdin to

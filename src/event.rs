@@ -53,7 +53,8 @@ pub enum Event {
         name: String,
         wave: usize,
         kind: ServiceKind,
-        pid: u32,
+        /// The host pid, when the runtime has one. A container does not.
+        pid: Option<u32>,
     },
     OneshotCompleted {
         name: String,

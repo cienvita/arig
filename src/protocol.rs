@@ -53,7 +53,8 @@ pub struct ServiceSnapshot {
     pub name: String,
     pub kind: String,
     pub wave: usize,
-    pub pid: u32,
+    /// Absent for a runtime whose services are not host processes.
+    pub pid: Option<u32>,
     pub status: String,
 }
 

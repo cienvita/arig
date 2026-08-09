@@ -4,6 +4,7 @@
 //! owns the mechanics of one service: spawning it, waiting on it, and getting
 //! it to stop.
 
+pub mod docker;
 pub mod process;
 
 use crate::config::ServiceConfig;
@@ -34,9 +35,6 @@ pub struct Exit {
 
 impl Exit {
     /// An exit the runtime describes by a status code alone.
-    // Used by the tests until the docker runtime, the first runtime that gets
-    // a bare code back, lands in the next commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_code(code: i64) -> Self {
         Self {
             success: code == 0,
@@ -77,6 +75,13 @@ pub enum StopOutcome {
 pub trait Runtime: Send + Sync {
     /// The name services select this runtime by, and its key in the registry.
     fn name(&self) -> &'static str;
+
+    /// Check a service block this runtime has been selected for. Called for
+    /// every service before the first one spawns, so a block naming keys this
+    /// runtime cannot use fails while there is still nothing to stop.
+    fn validate(&self, _name: &str, _spec: &ServiceConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService>;
 }

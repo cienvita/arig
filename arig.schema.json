@@ -57,8 +57,11 @@
       "type": "object",
       "properties": {
         "command": {
-          "description": "Command line to execute. Run via the system shell.",
-          "type": "string"
+          "description": "Command line to execute. Required by the `process` runtime. On\n`docker` it overrides the image's command, and may be omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "depends_on": {
           "description": "Other service names that must be ready before this one starts.",
@@ -76,6 +79,21 @@
           },
           "default": {}
         },
+        "image": {
+          "description": "Container image. Required by the `docker` runtime, ignored otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ports": {
+          "description": "Ports to publish, as \"host:container\" or a bare port for both.\n`docker` only.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "ready": {
           "description": "Optional readiness probe. Dependents wait until this passes.",
           "anyOf": [
@@ -86,6 +104,11 @@
               "type": "null"
             }
           ]
+        },
+        "runtime": {
+          "description": "Which runtime runs this service. `process` runs it via the system\nshell; `docker` runs it as a container.",
+          "type": "string",
+          "default": "process"
         },
         "shutdown": {
           "description": "Optional shutdown hook. When present, this command is run instead of\nsignalling the process directly. Useful for thin CLI wrappers that\ndelegate to a daemon (e.g. `docker compose up`).",
@@ -116,10 +139,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "command"
-      ]
+      }
     },
     "ServiceType": {
       "description": "How arig should treat a service for shutdown and exit semantics.",
