@@ -4,10 +4,12 @@
 //! owns the mechanics of one service: spawning it, waiting on it, and getting
 //! it to stop.
 
+pub mod docker;
 pub mod process;
 
 use crate::config::ServiceConfig;
 use async_trait::async_trait;
+use std::fmt;
 use std::process::ExitStatus;
 use tokio::io::AsyncRead;
 
@@ -20,10 +22,51 @@ pub struct SpawnedService {
     pub stderr: Option<OutputStream>,
 }
 
+/// How a service ended. The kernel asks only whether it succeeded and how to
+/// name it in a log line, so a runtime whose services are not local processes
+/// has no `ExitStatus` to invent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exit {
+    success: bool,
+    /// How the runtime words this exit. Repeated verbatim in log lines, so it
+    /// keeps whatever detail the runtime has: a signal name, a docker status.
+    description: String,
+}
+
+impl Exit {
+    /// An exit the runtime describes by a status code alone.
+    pub fn from_code(code: i64) -> Self {
+        Self {
+            success: code == 0,
+            description: format!("exit code {code}"),
+        }
+    }
+
+    pub fn success(&self) -> bool {
+        self.success
+    }
+}
+
+impl fmt::Display for Exit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+impl From<ExitStatus> for Exit {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            success: status.success(),
+            // Keeps the platform wording, including the signal on unix.
+            description: status.to_string(),
+        }
+    }
+}
+
 /// How a service ended once it was asked to stop.
 pub enum StopOutcome {
     /// It exited on its own, after whatever the runtime does to ask nicely.
-    Exited(ExitStatus),
+    Exited(Exit),
     /// It outlasted every graceful path and was killed.
     Killed,
 }
@@ -33,6 +76,13 @@ pub trait Runtime: Send + Sync {
     /// The name services select this runtime by, and its key in the registry.
     fn name(&self) -> &'static str;
 
+    /// Check a service block this runtime has been selected for. Called for
+    /// every service before the first one spawns, so a block naming keys this
+    /// runtime cannot use fails while there is still nothing to stop.
+    fn validate(&self, _name: &str, _spec: &ServiceConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService>;
 }
 
@@ -40,7 +90,7 @@ pub trait Runtime: Send + Sync {
 pub trait RunningService: Send {
     fn pid(&self) -> Option<u32>;
 
-    async fn wait(&mut self) -> anyhow::Result<ExitStatus>;
+    async fn wait(&mut self) -> anyhow::Result<Exit>;
 
     /// Set the service on its way out without blocking. The kernel calls this
     /// for every service in a wave before it waits on any of them, so a wave

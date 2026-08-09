@@ -73,9 +73,13 @@ fn print_ps(services: &[protocol::ServiceSnapshot]) {
         "NAME", "WAVE", "PID", "KIND", "STATUS",
     );
     for s in services {
+        let pid = match s.pid {
+            Some(pid) => pid.to_string(),
+            None => "-".to_string(),
+        };
         println!(
             "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}",
-            s.name, s.wave, s.pid, s.kind, s.status,
+            s.name, s.wave, pid, s.kind, s.status,
         );
     }
 }

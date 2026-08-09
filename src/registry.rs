@@ -6,6 +6,7 @@ use crate::event::Bus;
 use crate::probe::tcp::TcpProbe;
 use crate::probe::{Probe, ReadyCheck};
 use crate::runtime::Runtime;
+use crate::runtime::docker::DockerRuntime;
 use crate::runtime::process::ProcessRuntime;
 use crate::sink::LogSink;
 use crate::sink::console::ConsoleSink;
@@ -14,8 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// The runtime a service runs on when it does not ask for another. Nothing in
-/// the config selects a runtime yet, so this is every service.
+/// The runtime a service runs on when its block does not name one.
 pub const DEFAULT_RUNTIME: &str = crate::runtime::process::NAME;
 
 /// A readiness check bound to a service, with the kind of probe that produced
@@ -37,6 +37,7 @@ impl Registry {
     pub fn with_builtins(bus: &Bus, session_dir: &Path) -> Self {
         let mut registry = Self::default();
         registry.register(Arc::new(ProcessRuntime::new(bus.clone())));
+        registry.register(Arc::new(DockerRuntime::new(bus.clone())));
         registry.register_probe(Arc::new(TcpProbe));
         registry.register_sink(Box::new(ConsoleSink));
         registry.register_sink(Box::new(FileSink::new(

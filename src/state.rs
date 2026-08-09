@@ -76,7 +76,7 @@ mod tests {
             name: name.to_string(),
             wave,
             kind,
-            pid,
+            pid: Some(pid),
         }
     }
 
@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(snapshot[0].name, "api");
         assert_eq!(snapshot[0].kind, "service");
         assert_eq!(snapshot[0].wave, 1);
-        assert_eq!(snapshot[0].pid, 22);
+        assert_eq!(snapshot[0].pid, Some(22));
         assert_eq!(snapshot[0].status, "running");
     }
 

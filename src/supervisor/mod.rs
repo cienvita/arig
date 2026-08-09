@@ -7,8 +7,8 @@ use crate::event::{Bus, Event, ServiceKind, event};
 use crate::ipc;
 use crate::probe::ReadyCheck;
 use crate::protocol;
-use crate::registry::{BoundProbe, DEFAULT_RUNTIME, Registry};
-use crate::runtime::{RunningService, StopOutcome};
+use crate::registry::{BoundProbe, Registry};
+use crate::runtime::{Exit, RunningService, StopOutcome};
 use crate::sink;
 use crate::state::{self, StateTracker};
 use anyhow::Context;
@@ -150,8 +150,23 @@ impl Kernel {
         Ok(probes)
     }
 
+    /// Check every service against the runtime it selected, before anything
+    /// spawns. Same reasoning as the probes: a service block naming a runtime
+    /// that does not exist, or keys that runtime cannot use, should fail while
+    /// there is still nothing to stop.
+    fn validate_services(&self) -> anyhow::Result<()> {
+        for (name, service) in &self.config.services {
+            self.registry
+                .runtime(&service.runtime)
+                .and_then(|runtime| runtime.validate(name, service))
+                .with_context(|| format!("service '{name}'"))?;
+        }
+        Ok(())
+    }
+
     async fn run(&self) -> anyhow::Result<()> {
         let waves = dag::toposort(&self.config)?;
+        self.validate_services()?;
         let mut probes = self.resolve_probes()?;
         let mut children: Vec<ManagedChild> = Vec::new();
 
@@ -161,10 +176,13 @@ impl Kernel {
 
             for name in wave {
                 let service = &self.config.services[name];
-                let runtime = self.registry.runtime(DEFAULT_RUNTIME)?;
+                let runtime = self.registry.runtime(&service.runtime)?;
                 let mut spawned = runtime.spawn(name, service).await?;
-                let pid = spawned.handle.pid().unwrap_or(0);
-                event!(self.bus, "arig: started {name} (PID {pid})");
+                let pid = spawned.handle.pid();
+                match pid {
+                    Some(pid) => event!(self.bus, "arig: started {name} (PID {pid})"),
+                    None => event!(self.bus, "arig: started {name}"),
+                }
 
                 let tail = logs::new_tail();
                 let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
@@ -499,7 +517,7 @@ async fn wait_oneshot(
     handle: &mut dyn RunningService,
     timeout: Option<Duration>,
     last_output: LastOutput,
-) -> anyhow::Result<std::process::ExitStatus> {
+) -> anyhow::Result<Exit> {
     let heartbeat = tokio::spawn(oneshot_heartbeat(
         bus.clone(),
         name.to_string(),
@@ -514,7 +532,7 @@ async fn wait_oneshot_inner(
     name: &str,
     handle: &mut dyn RunningService,
     timeout: Option<Duration>,
-) -> anyhow::Result<std::process::ExitStatus> {
+) -> anyhow::Result<Exit> {
     let Some(limit) = timeout else {
         return handle.wait().await;
     };
@@ -648,9 +666,9 @@ mod tests {
     use super::*;
     use crate::config::{DirsConfig, ReadyProbe, ServiceConfig};
     use crate::probe::Probe;
+    use crate::registry::DEFAULT_RUNTIME;
     use crate::runtime::{Runtime, SpawnedService};
     use async_trait::async_trait;
-    use std::process::ExitStatus;
     use tokio::sync::broadcast::error::RecvError;
 
     /// What the kernel asked of the services, in the order it asked.
@@ -707,7 +725,7 @@ mod tests {
             Some(4242)
         }
 
-        async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
+        async fn wait(&mut self) -> anyhow::Result<Exit> {
             // Long-running: nothing but shutdown ends this.
             std::future::pending().await
         }
@@ -721,7 +739,7 @@ mod tests {
             if self.force_kill {
                 StopOutcome::Killed
             } else {
-                StopOutcome::Exited(exit_success())
+                StopOutcome::Exited(Exit::from_code(0))
             }
         }
 
@@ -773,17 +791,12 @@ mod tests {
         }
     }
 
-    fn exit_success() -> ExitStatus {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatusExt::from_raw(0)
-    }
-
     fn service(depends_on: &[&str], ready: Option<ReadyProbe>) -> ServiceConfig {
         ServiceConfig {
-            command: "never run: the fake runtime ignores it".to_string(),
+            runtime: DEFAULT_RUNTIME.to_string(),
+            command: Some("never run: the fake runtime ignores it".to_string()),
+            image: None,
+            ports: Vec::new(),
             service_type: ServiceType::Service,
             working_dir: None,
             env: HashMap::new(),

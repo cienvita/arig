@@ -183,7 +183,7 @@ mod tests {
             name: "api".to_string(),
             wave: 0,
             kind: ServiceKind::Service,
-            pid: 1,
+            pid: Some(1),
         });
         bus.drain(&cursor, Duration::from_secs(5)).await;
 

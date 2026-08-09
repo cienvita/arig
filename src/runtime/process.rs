@@ -1,11 +1,11 @@
 //! The built-in runtime: services are commands run through the system shell.
 
-use super::{OutputStream, RunningService, Runtime, SpawnedService, StopOutcome};
+use super::{Exit, OutputStream, RunningService, Runtime, SpawnedService, StopOutcome};
 use crate::config::{ServiceConfig, ServiceType};
 use crate::event::{Bus, event};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -29,6 +29,13 @@ impl ProcessRuntime {
 impl Runtime for ProcessRuntime {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn validate(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<()> {
+        if spec.command.is_none() {
+            anyhow::bail!("service '{name}' has no command");
+        }
+        Ok(())
     }
 
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
@@ -77,8 +84,8 @@ impl RunningService for ProcessChild {
         self.child.id()
     }
 
-    async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
-        Ok(self.child.wait().await?)
+    async fn wait(&mut self) -> anyhow::Result<Exit> {
+        Ok(self.child.wait().await?.into())
     }
 
     fn begin_stop(&mut self) {
@@ -133,7 +140,7 @@ impl RunningService for ProcessChild {
         let _ = hook_child.wait().await;
 
         if let Ok(Ok(status)) = stopped {
-            return StopOutcome::Exited(status);
+            return StopOutcome::Exited(status.into());
         }
 
         // The hook ran but the service is still up. Signal it and give it the
@@ -157,7 +164,7 @@ impl ProcessChild {
     /// Wait out `grace` and kill whatever is left.
     async fn wait_or_kill(&mut self, grace: Duration) -> StopOutcome {
         match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(Ok(status)) => StopOutcome::Exited(status),
+            Ok(Ok(status)) => StopOutcome::Exited(status.into()),
             _ => {
                 event!(
                     self.bus,
@@ -172,8 +179,15 @@ impl ProcessChild {
 }
 
 fn spawn_child(service: &ServiceConfig) -> anyhow::Result<tokio::process::Child> {
+    // `validate` has already rejected a service with no command; this keeps
+    // spawn_child honest for callers that skip it.
+    let command = service
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("service has no command"))?;
+
     let mut cmd = Command::new(shell_program());
-    cmd.args(shell_args(&service.command))
+    cmd.args(shell_args(command))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -316,7 +330,10 @@ mod tests {
 
     fn svc(command: &str, service_type: ServiceType) -> ServiceConfig {
         ServiceConfig {
-            command: command.to_string(),
+            runtime: NAME.to_string(),
+            command: Some(command.to_string()),
+            image: None,
+            ports: Vec::new(),
             service_type,
             working_dir: None,
             env: HashMap::new(),
@@ -325,6 +342,18 @@ mod tests {
             timeout: None,
             shutdown: None,
         }
+    }
+
+    #[test]
+    fn a_service_with_no_command_is_rejected_before_it_spawns() {
+        let mut spec = svc("unused", ServiceType::Service);
+        spec.command = None;
+
+        let err = ProcessRuntime::new(Bus::new(1))
+            .validate("api", &spec)
+            .err()
+            .expect("a process service must have a command");
+        assert!(err.to_string().contains("api"), "got: {err}");
     }
 
     // A command that blocks on stdin until it sees EOF. `cat` copies stdin to

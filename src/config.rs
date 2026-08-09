@@ -56,8 +56,19 @@ pub enum ServiceType {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ServiceConfig {
-    /// Command line to execute. Run via the system shell.
-    pub command: String,
+    /// Which runtime runs this service. `process` runs it via the system
+    /// shell; `docker` runs it as a container.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+    /// Command line to execute. Required by the `process` runtime. On
+    /// `docker` it overrides the image's command, and may be omitted.
+    pub command: Option<String>,
+    /// Container image. Required by the `docker` runtime, ignored otherwise.
+    pub image: Option<String>,
+    /// Ports to publish, as "host:container" or a bare port for both.
+    /// `docker` only.
+    #[serde(default)]
+    pub ports: Vec<String>,
     #[serde(rename = "type", default)]
     pub service_type: ServiceType,
     /// Working directory for the command. Relative to the config file's directory.
@@ -111,10 +122,108 @@ fn default_probe_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_runtime() -> String {
+    crate::registry::DEFAULT_RUNTIME.to_string()
+}
+
+/// A published port, as the docker runtime needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    pub host: u16,
+    pub container: u16,
+}
+
+impl PortMapping {
+    /// Parse a `ports:` entry: "8080:80", or "80" for the same port on both
+    /// sides. Rejected here rather than at spawn time so a typo fails before
+    /// anything starts.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        let (host, container) = match spec.split_once(':') {
+            Some((h, c)) => (h, c),
+            None => (spec, spec),
+        };
+        let port = |s: &str, side| {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|e| anyhow::anyhow!("{side} port '{s}' in '{spec}' is not a port: {e}"))
+        };
+        Ok(Self {
+            host: port(host, "host")?,
+            container: port(container, "container")?,
+        })
+    }
+}
+
 impl ArigConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: ArigConfig = serde_yaml::from_str(&contents)?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_service_that_names_no_runtime_gets_the_process_one() {
+        let config: ArigConfig =
+            serde_yaml::from_str("services:\n  a:\n    command: echo hi\n").expect("parse");
+
+        assert_eq!(config.services["a"].runtime, "process");
+        assert_eq!(config.services["a"].command.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn a_docker_service_needs_no_command() {
+        let config: ArigConfig = serde_yaml::from_str(
+            "services:\n  db:\n    runtime: docker\n    image: postgres:16\n    ports: [\"5432:5432\"]\n",
+        )
+        .expect("parse");
+
+        let db = &config.services["db"];
+        assert_eq!(db.runtime, "docker");
+        assert_eq!(db.image.as_deref(), Some("postgres:16"));
+        assert!(db.command.is_none());
+        assert_eq!(db.ports, ["5432:5432"]);
+    }
+
+    #[test]
+    fn a_port_maps_both_sides() {
+        assert_eq!(
+            PortMapping::parse("8080:80").expect("parse"),
+            PortMapping {
+                host: 8080,
+                container: 80
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_port_is_the_same_on_both_sides() {
+        assert_eq!(
+            PortMapping::parse("5432").expect("parse"),
+            PortMapping {
+                host: 5432,
+                container: 5432
+            }
+        );
+    }
+
+    #[test]
+    fn a_port_that_is_not_a_number_says_which_side_was_wrong() {
+        let err = PortMapping::parse("http:80")
+            .err()
+            .expect("'http' is not a port number");
+        assert!(err.to_string().contains("host"), "got: {err}");
+    }
+
+    #[test]
+    fn a_port_out_of_range_is_rejected() {
+        assert!(
+            PortMapping::parse("70000:80").is_err(),
+            "70000 does not fit in a port"
+        );
     }
 }

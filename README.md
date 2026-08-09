@@ -16,7 +16,13 @@ Reads `arig.yaml` in the current directory. Example:
 
     services:
       db:
-        command: docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres:16
+        runtime: docker
+        image: postgres:16
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_PASSWORD: dev
+        ready:
+          tcp: 127.0.0.1:5432
 
       migrate:
         command: ./scripts/migrate.sh
@@ -27,6 +33,20 @@ Reads `arig.yaml` in the current directory. Example:
         command: cargo run
         working_dir: ./api
         depends_on: [migrate]
+
+## Runtimes
+
+`runtime:` picks what runs a service. It defaults to `process`.
+
+`process` runs `command` through the system shell.
+
+`docker` runs `image` as a container on the local daemon, named
+`arig-<service>`. `ports` publishes to the host as `host:container`, or a bare
+port for both. `env` becomes the container's environment. `command` overrides
+the image's command and is split on whitespace, since a container takes an
+argv rather than a shell line. Containers are removed when the service stops,
+and one left behind by an earlier run is replaced rather than treated as a
+conflict.
 
 ## Editor integration
 
@@ -45,7 +65,8 @@ To match the schema to your installed binary instead, generate it locally:
 Near-term:
 - [x] `-C dir` flag (chdir before reading config)
 - [ ] Resolve `working_dir` and template paths against the yaml file's directory
-- [ ] HTTP/TCP health checks with readiness gating
+- [x] TCP health checks with readiness gating
+- [ ] HTTP health checks
 - [ ] Template rendering for `.arig/templates` -> `.arig/generated`
 - [ ] Dynamic env injection from dependency metadata
 
@@ -55,7 +76,7 @@ Command surface:
 - [ ] Single-service commands (`status`, `logs`, `env`, `restart`, `build`)
 
 Plugin platform:
-- [ ] Docker runtime via bollard
+- [x] Docker runtime via bollard
 - [ ] Helm/k8s publish plugins
 - [ ] External plugin protocol
 - [ ] `arig mcp` server

@@ -77,7 +77,10 @@ mod tests {
 
     fn svc(command: &str, depends_on: Vec<&str>) -> ServiceConfig {
         ServiceConfig {
-            command: command.to_string(),
+            runtime: crate::registry::DEFAULT_RUNTIME.to_string(),
+            command: Some(command.to_string()),
+            image: None,
+            ports: Vec::new(),
             service_type: Default::default(),
             working_dir: None,
             env: HashMap::new(),
