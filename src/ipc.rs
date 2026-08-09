@@ -29,23 +29,64 @@ impl Endpoint {
     }
 }
 
+/// Longest path an AF_UNIX address can hold, NUL terminator included. Linux
+/// allows 108 bytes, macOS and the BSDs 104.
+#[cfg(all(unix, target_os = "linux"))]
+const SUN_PATH_MAX: usize = 108;
+#[cfg(all(unix, not(target_os = "linux")))]
+const SUN_PATH_MAX: usize = 104;
+
+/// Bases that can hold sockets, most preferred first. Sockets live outside the
+/// workspace: a workspace deep enough to push its own socket path past
+/// SUN_PATH_MAX could not be started at all.
+#[cfg(unix)]
+fn runtime_bases() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    // Set by logind and friends. Already per-user, already short.
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        bases.push(PathBuf::from(dir).join("arig"));
+    }
+    // The fallbacks are shared, so the uid keeps two users on one host from
+    // racing for a directory neither of them can write into.
+    let uid = unsafe { libc::getuid() };
+    let leaf = format!("arig-{uid}");
+    if let Some(dir) = std::env::var_os("TMPDIR").filter(|d| !d.is_empty()) {
+        bases.push(PathBuf::from(dir).join(&leaf));
+    }
+    bases.push(PathBuf::from("/tmp").join(&leaf));
+    bases
+}
+
 #[cfg(unix)]
 fn endpoint_from_canonical(abs: &Path) -> Result<Endpoint> {
-    let parent = abs.join(".arig/var/run");
-    Ok(Endpoint {
-        address: parent.join("arig.sock").to_string_lossy().into_owned(),
-        pidfile: parent.join("arig.pid"),
-        parent,
-    })
+    // Unix paths are case-sensitive, so hash the bytes as they are.
+    let h = fnv1a_64(abs.as_os_str().as_encoded_bytes());
+    for parent in runtime_bases() {
+        let address = parent
+            .join(format!("{h:016x}.sock"))
+            .to_string_lossy()
+            .into_owned();
+        if address.len() >= SUN_PATH_MAX {
+            continue;
+        }
+        return Ok(Endpoint {
+            address,
+            pidfile: parent.join(format!("{h:016x}.pid")),
+            parent,
+        });
+    }
+    anyhow::bail!(
+        "no runtime directory short enough for a socket path; \
+         set XDG_RUNTIME_DIR or TMPDIR to a shorter directory"
+    )
 }
 
 #[cfg(windows)]
 fn endpoint_from_canonical(abs: &Path) -> Result<Endpoint> {
     // Pipe names are a global namespace, so we mix the canonical workspace path
-    // into the name. FNV-1a is deterministic across rustc versions (unlike the
-    // std DefaultHasher), so upgrades don't orphan existing supervisors. Path
-    // comparison on Windows is case-insensitive at the FS level, so we
-    // lowercase first to keep two clients of the same dir in agreement.
+    // into the name. Path comparison on Windows is case-insensitive at the FS
+    // level, so we lowercase first to keep two clients of the same dir in
+    // agreement.
     let key = abs.as_os_str().to_string_lossy().to_lowercase();
     let h = fnv1a_64(key.as_bytes());
     Ok(Endpoint {
@@ -53,7 +94,8 @@ fn endpoint_from_canonical(abs: &Path) -> Result<Endpoint> {
     })
 }
 
-#[cfg(windows)]
+/// FNV-1a, chosen because it is deterministic across rustc versions (unlike the
+/// std DefaultHasher), so upgrades don't orphan existing supervisors.
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -82,7 +124,13 @@ pub type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 #[cfg(unix)]
 pub fn bind(endpoint: &Endpoint) -> Result<Listener> {
-    std::fs::create_dir_all(&endpoint.parent)
+    use std::os::unix::fs::DirBuilderExt;
+    // 0700 because the fallback bases are world-writable and connecting to the
+    // socket is full control of the supervisor.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&endpoint.parent)
         .with_context(|| format!("create {}", endpoint.parent.display()))?;
     cleanup_stale(endpoint)?;
     let listener =
@@ -252,5 +300,46 @@ mod tests {
         let a = Endpoint::for_workspace(&dir).unwrap();
         let b = Endpoint::for_workspace(&dir).unwrap();
         assert_eq!(a.address, b.address);
+    }
+
+    #[test]
+    fn distinct_workspaces_get_distinct_endpoints() {
+        let here = std::env::current_dir().unwrap();
+        let up = here.parent().unwrap().to_path_buf();
+        assert_ne!(
+            Endpoint::for_workspace(&here).unwrap().address,
+            Endpoint::for_workspace(&up).unwrap().address,
+        );
+    }
+
+    #[cfg(unix)]
+    fn deep_workspace(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("arig-test-{tag}-{}", std::process::id()));
+        let mut dir = root.clone();
+        for _ in 0..12 {
+            dir = dir.join("0123456789abcdef0123456789abcdef");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binds_in_a_deep_workspace() {
+        // Regression: the socket used to sit under the workspace, so a path
+        // this deep pushed it past SUN_PATH_MAX and could not be bound at all.
+        let (root, dir) = deep_workspace("deep");
+        let endpoint = Endpoint::for_workspace(&dir).unwrap();
+        assert!(
+            endpoint.address.len() < SUN_PATH_MAX,
+            "{}",
+            endpoint.address
+        );
+
+        let listener = bind(&endpoint).unwrap();
+        assert!(probe(&endpoint).await);
+        drop(listener);
+        cleanup(&endpoint);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
