@@ -8,7 +8,7 @@ use crate::ipc;
 use crate::probe::ReadyCheck;
 use crate::protocol;
 use crate::registry::{BoundProbe, DEFAULT_RUNTIME, Registry};
-use crate::runtime::{RunningService, StopOutcome};
+use crate::runtime::{Exit, RunningService, StopOutcome};
 use crate::sink;
 use crate::state::{self, StateTracker};
 use anyhow::Context;
@@ -499,7 +499,7 @@ async fn wait_oneshot(
     handle: &mut dyn RunningService,
     timeout: Option<Duration>,
     last_output: LastOutput,
-) -> anyhow::Result<std::process::ExitStatus> {
+) -> anyhow::Result<Exit> {
     let heartbeat = tokio::spawn(oneshot_heartbeat(
         bus.clone(),
         name.to_string(),
@@ -514,7 +514,7 @@ async fn wait_oneshot_inner(
     name: &str,
     handle: &mut dyn RunningService,
     timeout: Option<Duration>,
-) -> anyhow::Result<std::process::ExitStatus> {
+) -> anyhow::Result<Exit> {
     let Some(limit) = timeout else {
         return handle.wait().await;
     };
@@ -650,7 +650,6 @@ mod tests {
     use crate::probe::Probe;
     use crate::runtime::{Runtime, SpawnedService};
     use async_trait::async_trait;
-    use std::process::ExitStatus;
     use tokio::sync::broadcast::error::RecvError;
 
     /// What the kernel asked of the services, in the order it asked.
@@ -707,7 +706,7 @@ mod tests {
             Some(4242)
         }
 
-        async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
+        async fn wait(&mut self) -> anyhow::Result<Exit> {
             // Long-running: nothing but shutdown ends this.
             std::future::pending().await
         }
@@ -721,7 +720,7 @@ mod tests {
             if self.force_kill {
                 StopOutcome::Killed
             } else {
-                StopOutcome::Exited(exit_success())
+                StopOutcome::Exited(Exit::from_code(0))
             }
         }
 
@@ -771,14 +770,6 @@ mod tests {
                 Err("nothing there".to_string())
             }
         }
-    }
-
-    fn exit_success() -> ExitStatus {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatusExt::from_raw(0)
     }
 
     fn service(depends_on: &[&str], ready: Option<ReadyProbe>) -> ServiceConfig {

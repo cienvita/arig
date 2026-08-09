@@ -1,11 +1,11 @@
 //! The built-in runtime: services are commands run through the system shell.
 
-use super::{OutputStream, RunningService, Runtime, SpawnedService, StopOutcome};
+use super::{Exit, OutputStream, RunningService, Runtime, SpawnedService, StopOutcome};
 use crate::config::{ServiceConfig, ServiceType};
 use crate::event::{Bus, event};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -77,8 +77,8 @@ impl RunningService for ProcessChild {
         self.child.id()
     }
 
-    async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
-        Ok(self.child.wait().await?)
+    async fn wait(&mut self) -> anyhow::Result<Exit> {
+        Ok(self.child.wait().await?.into())
     }
 
     fn begin_stop(&mut self) {
@@ -133,7 +133,7 @@ impl RunningService for ProcessChild {
         let _ = hook_child.wait().await;
 
         if let Ok(Ok(status)) = stopped {
-            return StopOutcome::Exited(status);
+            return StopOutcome::Exited(status.into());
         }
 
         // The hook ran but the service is still up. Signal it and give it the
@@ -157,7 +157,7 @@ impl ProcessChild {
     /// Wait out `grace` and kill whatever is left.
     async fn wait_or_kill(&mut self, grace: Duration) -> StopOutcome {
         match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(Ok(status)) => StopOutcome::Exited(status),
+            Ok(Ok(status)) => StopOutcome::Exited(status.into()),
             _ => {
                 event!(
                     self.bus,

@@ -8,6 +8,7 @@ pub mod process;
 
 use crate::config::ServiceConfig;
 use async_trait::async_trait;
+use std::fmt;
 use std::process::ExitStatus;
 use tokio::io::AsyncRead;
 
@@ -20,10 +21,54 @@ pub struct SpawnedService {
     pub stderr: Option<OutputStream>,
 }
 
+/// How a service ended. The kernel asks only whether it succeeded and how to
+/// name it in a log line, so a runtime whose services are not local processes
+/// has no `ExitStatus` to invent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exit {
+    success: bool,
+    /// How the runtime words this exit. Repeated verbatim in log lines, so it
+    /// keeps whatever detail the runtime has: a signal name, a docker status.
+    description: String,
+}
+
+impl Exit {
+    /// An exit the runtime describes by a status code alone.
+    // Used by the tests until the docker runtime, the first runtime that gets
+    // a bare code back, lands in the next commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_code(code: i64) -> Self {
+        Self {
+            success: code == 0,
+            description: format!("exit code {code}"),
+        }
+    }
+
+    pub fn success(&self) -> bool {
+        self.success
+    }
+}
+
+impl fmt::Display for Exit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+impl From<ExitStatus> for Exit {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            success: status.success(),
+            // Keeps the platform wording, including the signal on unix.
+            description: status.to_string(),
+        }
+    }
+}
+
 /// How a service ended once it was asked to stop.
 pub enum StopOutcome {
     /// It exited on its own, after whatever the runtime does to ask nicely.
-    Exited(ExitStatus),
+    Exited(Exit),
     /// It outlasted every graceful path and was killed.
     Killed,
 }
@@ -40,7 +85,7 @@ pub trait Runtime: Send + Sync {
 pub trait RunningService: Send {
     fn pid(&self) -> Option<u32>;
 
-    async fn wait(&mut self) -> anyhow::Result<ExitStatus>;
+    async fn wait(&mut self) -> anyhow::Result<Exit>;
 
     /// Set the service on its way out without blocking. The kernel calls this
     /// for every service in a wave before it waits on any of them, so a wave
