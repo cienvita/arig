@@ -3,9 +3,11 @@ mod config;
 mod dag;
 mod event;
 mod ipc;
+mod probe;
 mod protocol;
 mod registry;
 mod runtime;
+mod sink;
 mod state;
 mod supervisor;
 

@@ -1,28 +1,29 @@
 mod logs;
 mod platform;
 
-use crate::config::{ArigConfig, ReadyProbe, ServiceType};
+use crate::config::{ArigConfig, ServiceType};
 use crate::dag;
 use crate::event::{Bus, Event, ServiceKind, event};
 use crate::ipc;
+use crate::probe::ReadyCheck;
 use crate::protocol;
-use crate::registry::{DEFAULT_RUNTIME, Registry};
+use crate::registry::{BoundProbe, DEFAULT_RUNTIME, Registry};
 use crate::runtime::{RunningService, StopOutcome};
+use crate::sink;
 use crate::state::{self, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
 use logs::{LastOutput, LogTail};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::signal;
 
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
-const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A service the kernel is responsible for: the runtime's handle on it, plus
@@ -34,6 +35,13 @@ struct ManagedChild {
     tail: LogTail,
     last_output: LastOutput,
     io_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// A readiness check the kernel must see pass before the next wave starts.
+struct PendingProbe {
+    probe: BoundProbe,
+    /// How long to keep retrying before the wave fails.
+    timeout: Duration,
 }
 
 struct IpcCleanup(ipc::Endpoint);
@@ -50,7 +58,6 @@ impl Drop for IpcCleanup {
 struct Kernel {
     config: ArigConfig,
     bus: Bus,
-    session_dir: PathBuf,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     registry: Registry,
 }
@@ -79,10 +86,11 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         });
     }
 
-    let session_dir = logs::create_session_dir(&config.dirs.logs)?;
-    // Subscribe the sinks before the first line is emitted; anything emitted
-    // earlier is gone by the time they attach.
-    let session_log = logs::SessionLog::spawn(&bus, logs::open_log_file(&session_dir, "_arig")?);
+    let session_dir = sink::file::create_session_dir(&config.dirs.logs)?;
+    let mut registry = Registry::with_builtins(&bus, &session_dir);
+    // Attach the sinks before the first line is emitted; anything emitted
+    // earlier is gone by the time they subscribe.
+    let sinks = sink::spawn(&bus, registry.take_sinks());
     let state = state::spawn(&bus);
     event!(bus, "arig: logs at {}", session_dir.display());
 
@@ -102,26 +110,54 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
     let kernel = Kernel {
         config,
         bus: bus.clone(),
-        session_dir,
         shutdown_rx,
-        registry: Registry::with_builtins(&bus),
+        registry,
     };
     let result = kernel.run().await;
 
-    // The session log is a task of its own, so give it a moment to write the
+    // The sinks run in a task of their own, so give them a moment to write the
     // lines emitted just before we return.
-    bus.drain(session_log.cursor(), IO_DRAIN_TIMEOUT).await;
+    bus.drain(&sinks, IO_DRAIN_TIMEOUT).await;
     result
 }
 
 impl Kernel {
+    /// Bind every readiness check before anything spawns, so a `ready:` block
+    /// no probe can serve fails while there is still nothing to clean up.
+    /// Oneshots are skipped: dependents already wait for them to exit, so a
+    /// ready block on one has never meant anything.
+    fn resolve_probes(&self) -> anyhow::Result<HashMap<&str, PendingProbe>> {
+        let mut probes = HashMap::new();
+        for (name, service) in &self.config.services {
+            if service.service_type == ServiceType::Oneshot {
+                continue;
+            }
+            let Some(spec) = &service.ready else { continue };
+            let bound = self
+                .registry
+                .ready_check(spec)
+                .with_context(|| format!("service '{name}'"))?;
+            if let Some(probe) = bound {
+                probes.insert(
+                    name.as_str(),
+                    PendingProbe {
+                        probe,
+                        timeout: spec.timeout,
+                    },
+                );
+            }
+        }
+        Ok(probes)
+    }
+
     async fn run(&self) -> anyhow::Result<()> {
         let waves = dag::toposort(&self.config)?;
+        let mut probes = self.resolve_probes()?;
         let mut children: Vec<ManagedChild> = Vec::new();
 
         for (wave_idx, wave) in waves.iter().enumerate() {
             let mut wave_oneshots: Vec<ManagedChild> = Vec::new();
-            let mut wave_probes: Vec<(String, ReadyProbe)> = Vec::new();
+            let mut wave_probes: Vec<(String, PendingProbe)> = Vec::new();
 
             for name in wave {
                 let service = &self.config.services[name];
@@ -131,10 +167,9 @@ impl Kernel {
                 event!(self.bus, "arig: started {name} (PID {pid})");
 
                 let tail = logs::new_tail();
-                let log_file = logs::open_log_file(&self.session_dir, name)?;
                 let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
                 let io_tasks =
-                    logs::pipe_output(&mut spawned, name, &tail, &log_file, &last_output);
+                    logs::pipe_output(&mut spawned, name, &tail, &last_output, &self.bus);
 
                 let managed = ManagedChild {
                     name: name.clone(),
@@ -155,8 +190,8 @@ impl Kernel {
                 if service.service_type == ServiceType::Oneshot {
                     wave_oneshots.push(managed);
                 } else {
-                    if let Some(probe) = &service.ready {
-                        wave_probes.push((name.clone(), probe.clone()));
+                    if let Some(pending) = probes.remove(name.as_str()) {
+                        wave_probes.push((name.clone(), pending));
                     }
                     children.push(managed);
                 }
@@ -221,10 +256,10 @@ impl Kernel {
             }
 
             // Block on readiness probes for long-running services in this wave
-            for (name, probe) in wave_probes {
+            for (name, pending) in wave_probes {
                 let mut rx = self.shutdown_rx.clone();
                 let result = tokio::select! {
-                    r = wait_ready(&self.bus, &name, &probe) => r,
+                    r = wait_ready(&self.bus, &name, &pending) => r,
                     _ = rx.changed() => {
                         event!(self.bus, "\narig: shutting down...");
                         shutdown(&self.bus, &mut children, None).await;
@@ -516,42 +551,41 @@ async fn oneshot_heartbeat(bus: Bus, name: String, last_output: LastOutput) {
     }
 }
 
-async fn wait_ready(bus: &Bus, name: &str, probe: &ReadyProbe) -> anyhow::Result<()> {
-    let Some(tcp_addr) = probe.tcp.as_deref() else {
-        return Ok(());
-    };
+async fn wait_ready(bus: &Bus, name: &str, pending: &PendingProbe) -> anyhow::Result<()> {
+    let PendingProbe { probe, timeout } = pending;
+    let kind = probe.kind;
+    let check: &dyn ReadyCheck = probe.check.as_ref();
+    let target = check.target();
 
     event!(
         bus,
-        "arig: waiting for '{name}' tcp probe on {tcp_addr} (timeout {})",
-        humantime::format_duration(probe.timeout),
+        "arig: waiting for '{name}' {kind} probe on {target} (timeout {})",
+        humantime::format_duration(*timeout),
     );
 
-    let deadline = Instant::now() + probe.timeout;
+    let deadline = Instant::now() + *timeout;
     let mut last_heartbeat = Instant::now();
     loop {
-        let last_err: String =
-            match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(tcp_addr)).await {
-                Ok(Ok(_)) => {
-                    event!(bus, "arig: '{name}' is ready");
-                    return Ok(());
-                }
-                Ok(Err(e)) => e.to_string(),
-                Err(_) => "connect timed out".into(),
-            };
+        let last_err = match check.check().await {
+            Ok(()) => {
+                event!(bus, "arig: '{name}' is ready");
+                return Ok(());
+            }
+            Err(e) => e,
+        };
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             event!(
                 bus,
-                "arig: still waiting for '{name}' tcp {tcp_addr} (last error: {last_err})"
+                "arig: still waiting for '{name}' {kind} {target} (last error: {last_err})"
             );
             last_heartbeat = Instant::now();
         }
 
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "'{name}' tcp probe '{tcp_addr}' did not become ready within {}: last error: {last_err}",
-                humantime::format_duration(probe.timeout),
+                "'{name}' {kind} probe '{target}' did not become ready within {}: last error: {last_err}",
+                humantime::format_duration(*timeout),
             );
         }
 
@@ -612,10 +646,10 @@ fn stopped(bus: &Bus, name: &str, status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DirsConfig, ServiceConfig};
+    use crate::config::{DirsConfig, ReadyProbe, ServiceConfig};
+    use crate::probe::Probe;
     use crate::runtime::{Runtime, SpawnedService};
     use async_trait::async_trait;
-    use std::collections::HashMap;
     use std::process::ExitStatus;
     use tokio::sync::broadcast::error::RecvError;
 
@@ -696,6 +730,49 @@ mod tests {
         }
     }
 
+    /// Stands in for a real probe so readiness can be driven without anything
+    /// to connect to.
+    struct FakeProbe {
+        passes: bool,
+    }
+
+    impl Probe for FakeProbe {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn claims(&self, spec: &ReadyProbe) -> bool {
+            spec.tcp.is_some()
+        }
+
+        fn prepare(&self, spec: &ReadyProbe) -> anyhow::Result<Box<dyn ReadyCheck>> {
+            Ok(Box::new(FakeCheck {
+                target: spec.tcp.clone().unwrap_or_default(),
+                passes: self.passes,
+            }))
+        }
+    }
+
+    struct FakeCheck {
+        target: String,
+        passes: bool,
+    }
+
+    #[async_trait]
+    impl ReadyCheck for FakeCheck {
+        fn target(&self) -> &str {
+            &self.target
+        }
+
+        async fn check(&self) -> Result<(), String> {
+            if self.passes {
+                Ok(())
+            } else {
+                Err("nothing there".to_string())
+            }
+        }
+    }
+
     fn exit_success() -> ExitStatus {
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
@@ -704,32 +781,35 @@ mod tests {
         ExitStatusExt::from_raw(0)
     }
 
-    fn service(depends_on: &[&str]) -> ServiceConfig {
+    fn service(depends_on: &[&str], ready: Option<ReadyProbe>) -> ServiceConfig {
         ServiceConfig {
             command: "never run: the fake runtime ignores it".to_string(),
             service_type: ServiceType::Service,
             working_dir: None,
             env: HashMap::new(),
             depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
-            ready: None,
+            ready,
             timeout: None,
             shutdown: None,
         }
     }
 
-    fn session_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("arig-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A block the fake probe claims. Zero timeout so a probe that never
+    /// passes gives up on its first attempt instead of retrying for a minute.
+    fn ready_block() -> ReadyProbe {
+        ReadyProbe {
+            tcp: Some("wherever:1".to_string()),
+            timeout: Duration::ZERO,
+        }
     }
 
     /// Run the kernel over `services`, ask it to shut down once they are all
-    /// up, and report what the runtime saw and what reached the bus.
+    /// up, and report what the runtime saw and what reached the bus. With a
+    /// `probe`, every service gets a readiness block for it to answer.
     async fn run_to_shutdown(
-        tag: &str,
         services: &[(&str, &[&str])],
         force_kill: bool,
+        probe: Option<Arc<dyn Probe>>,
     ) -> (Vec<String>, Vec<Event>) {
         let bus = Bus::new(64);
         let mut collected = bus.subscribe();
@@ -742,17 +822,20 @@ mod tests {
             log: log.clone(),
             force_kill,
         }));
+        let ready = probe.is_some();
+        if let Some(probe) = probe {
+            registry.register_probe(probe);
+        }
 
         let kernel = Kernel {
             config: ArigConfig {
                 dirs: DirsConfig::default(),
                 services: services
                     .iter()
-                    .map(|(name, deps)| (name.to_string(), service(deps)))
+                    .map(|(name, deps)| (name.to_string(), service(deps, ready.then(ready_block))))
                     .collect(),
             },
             bus: bus.clone(),
-            session_dir: session_dir(tag),
             shutdown_rx,
             registry,
         };
@@ -777,21 +860,19 @@ mod tests {
         while let Ok(event) = collected.try_recv() {
             events.push(event);
         }
-        let _ = std::fs::remove_dir_all(session_dir(tag));
         (log.entries(), events)
     }
 
     #[tokio::test]
     async fn services_stop_in_reverse_wave_order() {
-        let (stops, _) =
-            run_to_shutdown("reverse-waves", &[("db", &[]), ("api", &["db"])], false).await;
+        let (stops, _) = run_to_shutdown(&[("db", &[]), ("api", &["db"])], false, None).await;
 
         assert_eq!(stops, ["begin api", "finish api", "begin db", "finish db"]);
     }
 
     #[tokio::test]
     async fn a_whole_wave_is_signalled_before_any_of_it_is_waited_on() {
-        let (stops, _) = run_to_shutdown("one-wave", &[("a", &[]), ("b", &[])], false).await;
+        let (stops, _) = run_to_shutdown(&[("a", &[]), ("b", &[])], false, None).await;
 
         // Which of the two goes first follows config iteration order, so the
         // claim is about the split between signalling and waiting.
@@ -808,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_service_the_runtime_had_to_kill_is_reported_as_killed() {
-        let (_, events) = run_to_shutdown("killed", &[("a", &[])], true).await;
+        let (_, events) = run_to_shutdown(&[("a", &[])], true, None).await;
 
         let exits: Vec<_> = events
             .iter()
@@ -818,5 +899,61 @@ mod tests {
             })
             .collect();
         assert_eq!(exits, [("a", "killed")]);
+    }
+
+    #[tokio::test]
+    async fn a_wave_waits_on_the_probe_the_registry_resolved() {
+        let (_, events) = run_to_shutdown(
+            &[("db", &[]), ("api", &["db"])],
+            false,
+            Some(Arc::new(FakeProbe { passes: true })),
+        )
+        .await;
+
+        // 'api' is in the second wave, so it only started because the probe
+        // for 'db' was consulted and passed first.
+        let lines: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Supervisor { line } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(lines.contains(&"arig: 'db' is ready"), "got: {lines:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_passes_fails_the_wave() {
+        let bus = Bus::new(64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let log = StopLog::default();
+
+        let mut registry = Registry::default();
+        registry.register(Arc::new(FakeRuntime {
+            log: log.clone(),
+            force_kill: false,
+        }));
+        registry.register_probe(Arc::new(FakeProbe { passes: false }));
+
+        let kernel = Kernel {
+            config: ArigConfig {
+                dirs: DirsConfig::default(),
+                services: [("api".to_string(), service(&[], Some(ready_block())))].into(),
+            },
+            bus,
+            shutdown_rx,
+            registry,
+        };
+
+        let err = kernel
+            .run()
+            .await
+            .expect_err("a service that never becomes ready must fail the wave");
+        assert!(
+            err.to_string().contains("readiness probe failed for 'api'"),
+            "got: {err}"
+        );
+        // The service that never came up is still stopped on the way out.
+        assert_eq!(log.entries(), ["begin api", "finish api"]);
     }
 }
