@@ -33,6 +33,7 @@ impl LifecycleReq {
 
 /// One step of a lifecycle command. A command is a sequence of these, so
 /// restart is stop then start rather than a case of its own.
+#[derive(PartialEq, Eq)]
 pub enum Phase {
     Stop,
     Start,

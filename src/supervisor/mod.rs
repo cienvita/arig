@@ -70,6 +70,10 @@ struct InFlight {
     no_wait: bool,
     /// Phases left to run.
     plan: VecDeque<Phase>,
+    /// The definition a start phase will spawn, read when the command was
+    /// accepted rather than when the phase runs: a restart has to fail on a
+    /// bad edit before it stops anything.
+    spec: Option<ServiceConfig>,
     /// The task running the current phase, if the phase has one.
     task: Option<Task>,
 }
@@ -135,6 +139,10 @@ impl Drop for IpcCleanup {
 /// the actual spawning.
 struct Kernel {
     config: ArigConfig,
+    /// Where that config was read from, so a start can read it again and pick
+    /// up an edit. `None` leaves every start on the definition the stack came
+    /// up with, which is what the tests run on.
+    config_path: Option<std::path::PathBuf>,
     bus: Bus,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     registry: Registry,
@@ -148,7 +156,11 @@ struct Kernel {
     msg_tx: mpsc::Sender<KernelMsg>,
 }
 
-pub async fn up(config: ArigConfig, detached: bool) -> anyhow::Result<()> {
+pub async fn up(
+    config: ArigConfig,
+    config_path: Option<std::path::PathBuf>,
+    detached: bool,
+) -> anyhow::Result<()> {
     #[cfg(windows)]
     let _job = platform::win::JobGuard::new()?;
 
@@ -197,6 +209,7 @@ pub async fn up(config: ArigConfig, detached: bool) -> anyhow::Result<()> {
 
     let kernel = Kernel {
         config,
+        config_path,
         bus: bus.clone(),
         shutdown_rx,
         registry,
@@ -632,8 +645,17 @@ impl Kernel {
         reply: oneshot::Sender<Result<(), String>>,
     ) {
         let name = req.service().to_string();
-        let plan = match self.plan(steady, &req) {
-            Ok(plan) => plan,
+        let prepared = self.plan(steady, &req).and_then(|plan| {
+            // A command that will start the service reads its definition now,
+            // while the running instance is still untouched.
+            let spec = match plan.contains(&Phase::Start) {
+                true => Some(self.prepare(&name)?),
+                false => None,
+            };
+            Ok((plan, spec))
+        });
+        let (plan, spec) = match prepared {
+            Ok(prepared) => prepared,
             Err(reason) => {
                 let _ = reply.send(Err(reason));
                 return;
@@ -646,6 +668,7 @@ impl Kernel {
                 reply: Some(reply),
                 no_wait: req.no_wait(),
                 plan,
+                spec,
                 task: None,
             },
         );
@@ -682,6 +705,63 @@ impl Kernel {
             }
             LifecycleReq::Restart { .. } => Ok(VecDeque::from([Phase::Start])),
         }
+    }
+
+    /// Read one service's definition again, so a start after an edit runs what
+    /// the config file says now rather than what it said at `up` time.
+    ///
+    /// Structural edits are refused: the waves, and with them the shutdown
+    /// order, were computed when the stack came up, and a service that no
+    /// longer means the same thing in the graph is not this command's to
+    /// adopt.
+    fn reload(&self, name: &str) -> Result<ServiceConfig, String> {
+        let current = self
+            .config
+            .services
+            .get(name)
+            .ok_or_else(|| format!("no service '{name}' in this stack"))?;
+        let Some(path) = &self.config_path else {
+            return Ok(current.clone());
+        };
+
+        let mut config = ArigConfig::load(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        let Some(fresh) = config.services.get(name) else {
+            return Err(format!(
+                "service '{name}' is not in the config anymore; bounce the stack to apply structural changes"
+            ));
+        };
+        if fresh.service_type != current.service_type {
+            return Err(format!(
+                "'{name}' changed type; bounce the stack to apply structural changes"
+            ));
+        }
+        let before: std::collections::HashSet<&str> =
+            current.depends_on.iter().map(String::as_str).collect();
+        let after: std::collections::HashSet<&str> =
+            fresh.depends_on.iter().map(String::as_str).collect();
+        if before != after {
+            return Err(format!(
+                "'{name}' changed depends_on; bounce the stack to apply structural changes"
+            ));
+        }
+
+        Ok(config.services.remove(name).expect("just looked it up"))
+    }
+
+    /// The definition a start should run, checked against the runtime that
+    /// will run it. Everything here happens before the old instance is
+    /// stopped, so a bad edit fails the command with the service still up.
+    fn prepare(&self, name: &str) -> Result<ServiceConfig, String> {
+        let spec = self.reload(name)?;
+        self.registry
+            .runtime(&spec.runtime)
+            .and_then(|runtime| runtime.validate(name, &spec))
+            .map_err(|err| err.to_string())?;
+        // A ready block no probe can serve is worth failing on here too.
+        self.resolve_probe(name, &spec)
+            .map_err(|err| err.to_string())?;
+        Ok(spec)
     }
 
     /// Run the next phase of a command, or answer its client once there are
@@ -760,19 +840,19 @@ impl Kernel {
         }
     }
 
-    /// Spawn one service again, from the definition the config holds for it.
+    /// Spawn one service again, from the definition read when the command was
+    /// accepted.
     async fn start_phase(&self, steady: &mut Steady, name: &str) -> Result<Started, String> {
-        let service = self
-            .config
-            .services
-            .get(name)
-            .ok_or_else(|| format!("no service '{name}' in this stack"))?;
-        self.registry
-            .runtime(&service.runtime)
-            .and_then(|runtime| runtime.validate(name, service))
-            .map_err(|err| err.to_string())?;
+        let service = match steady
+            .inflight
+            .get_mut(name)
+            .and_then(|entry| entry.spec.take())
+        {
+            Some(spec) => spec,
+            None => self.prepare(name)?,
+        };
         let probe = self
-            .resolve_probe(name, service)
+            .resolve_probe(name, &service)
             .map_err(|err| err.to_string())?;
 
         self.bus.emit(Event::StartRequested {
@@ -780,7 +860,7 @@ impl Kernel {
         });
         let wave = steady.wave_of.get(name).copied().unwrap_or(0);
         let managed = self
-            .spawn_service(name, service, wave, probe.is_some())
+            .spawn_service(name, &service, wave, probe.is_some())
             .await
             .map_err(|err| err.to_string())?;
         steady.children.push(managed);
@@ -1191,22 +1271,25 @@ mod tests {
 
     /// What the kernel asked of the services, in the order it asked.
     #[derive(Clone, Default)]
-    struct StopLog(Arc<Mutex<Vec<String>>>);
+    struct Journal(Arc<Mutex<Vec<String>>>);
 
-    impl StopLog {
+    impl Journal {
         fn record(&self, entry: String) {
-            self.0.lock().expect("stop log mutex poisoned").push(entry);
+            self.0.lock().expect("journal mutex poisoned").push(entry);
         }
 
         fn entries(&self) -> Vec<String> {
-            self.0.lock().expect("stop log mutex poisoned").clone()
+            self.0.lock().expect("journal mutex poisoned").clone()
         }
     }
 
     /// Stands in for a real runtime so the wave and shutdown ordering can be
     /// tested without spawning anything.
     struct FakeRuntime {
-        log: StopLog,
+        log: Journal,
+        /// Every spawn, with the command it was given, so a test can tell
+        /// which definition a start ran.
+        spawns: Journal,
         force_kill: bool,
         /// Name of a service that is to report itself already gone the first
         /// time the kernel asks.
@@ -1228,6 +1311,8 @@ mod tests {
         }
 
         async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
+            self.spawns
+                .record(format!("{name} {}", spec.command.as_deref().unwrap_or("-")));
             // A oneshot has to end for the wave to move on, and a crasher has
             // to end for the steady loop to notice it.
             let exits = (spec.service_type == ServiceType::Oneshot)
@@ -1251,7 +1336,7 @@ mod tests {
 
     struct FakeService {
         name: String,
-        log: StopLog,
+        log: Journal,
         force_kill: bool,
         /// What `try_exit` answers, standing in for a service that died while
         /// a later wave was still coming up.
@@ -1382,6 +1467,8 @@ mod tests {
         crashes: Option<String>,
         /// Services to declare as oneshots rather than long-running.
         oneshots: Vec<String>,
+        /// Config file to run from, for the tests that edit one mid-run.
+        config_file: Option<std::path::PathBuf>,
         /// Parks every stop until the test releases it.
         hold: Option<Arc<tokio::sync::Notify>>,
     }
@@ -1419,7 +1506,8 @@ mod tests {
         bus: Bus,
         collected: tokio::sync::broadcast::Receiver<Event>,
         state: StateTracker,
-        log: StopLog,
+        log: Journal,
+        spawns: Journal,
         /// Fed everything the kernel emits, so a test can read the rows `ps`
         /// would show without waiting on the tracker's own task.
         tracker: StateTracker,
@@ -1427,17 +1515,22 @@ mod tests {
         running: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     }
 
+    /// Build a kernel over `services`, or over the config file `setup` names,
+    /// in which case `services` is not used: the file is the definition, and
+    /// re-reading it is the point of those tests.
     fn build(services: &[(&str, &[&str])], setup: Setup) -> Stack {
         let bus = Bus::new(256);
         let collected = bus.subscribe();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (msg_tx, msg_rx) = mpsc::channel(COMMAND_QUEUE);
-        let log = StopLog::default();
+        let log = Journal::default();
+        let spawns = Journal::default();
         let state = StateTracker::default();
 
         let mut registry = Registry::default();
         registry.register(Arc::new(FakeRuntime {
             log: log.clone(),
+            spawns: spawns.clone(),
             force_kill: setup.force_kill,
             dies_during_startup: setup.dies_during_startup,
             crashes: setup.crashes,
@@ -1448,22 +1541,29 @@ mod tests {
             registry.register_probe(probe);
         }
 
-        let mut config: HashMap<String, ServiceConfig> = services
-            .iter()
-            .map(|(name, deps)| (name.to_string(), service(deps, ready.then(ready_block))))
-            .collect();
-        for name in &setup.oneshots {
-            config
-                .get_mut(name)
-                .expect("a oneshot must be one of the services")
-                .service_type = ServiceType::Oneshot;
-        }
+        let config = match &setup.config_file {
+            Some(path) => ArigConfig::load(path).expect("the test config must parse"),
+            None => {
+                let mut config: HashMap<String, ServiceConfig> = services
+                    .iter()
+                    .map(|(name, deps)| (name.to_string(), service(deps, ready.then(ready_block))))
+                    .collect();
+                for name in &setup.oneshots {
+                    config
+                        .get_mut(name)
+                        .expect("a oneshot must be one of the services")
+                        .service_type = ServiceType::Oneshot;
+                }
+                ArigConfig {
+                    dirs: DirsConfig::default(),
+                    services: config,
+                }
+            }
+        };
 
         let kernel = Kernel {
-            config: ArigConfig {
-                dirs: DirsConfig::default(),
-                services: config,
-            },
+            config,
+            config_path: setup.config_file,
             bus: bus.clone(),
             shutdown_rx,
             registry,
@@ -1481,6 +1581,7 @@ mod tests {
             collected,
             state,
             log,
+            spawns,
             tracker: StateTracker::default(),
             events: Vec::new(),
             running: None,
@@ -1563,6 +1664,11 @@ mod tests {
 
         fn stops(&self) -> Vec<String> {
             self.log.entries()
+        }
+
+        /// Every spawn so far, as "<service> <command>".
+        fn spawns(&self) -> Vec<String> {
+            self.spawns.entries()
         }
 
         fn is_running(&self) -> bool {
@@ -2002,6 +2108,105 @@ mod tests {
         .await
         .result
         .expect("clean shutdown");
+    }
+
+    /// A config file only this test writes to, so the edits below are visible
+    /// to a restart the way an operator's would be.
+    fn temp_config(tag: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arig-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("arig.yaml");
+        std::fs::write(&path, contents).expect("write config");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_restart_runs_the_definition_the_config_holds_now() {
+        let path = temp_config("edit", "services:\n  api:\n    command: first\n");
+        let edited = path.clone();
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                std::fs::write(&edited, "services:\n  api:\n    command: second\n")
+                    .expect("edit the config");
+                stack.command(restart("api")).await.expect("restart 'api'");
+
+                assert_eq!(stack.spawns(), ["api first", "api second"]);
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// The waves, and with them the shutdown order, were computed when the
+    /// stack came up; a restart is not where the graph changes.
+    #[tokio::test]
+    async fn a_restart_after_a_structural_edit_is_refused() {
+        let path = temp_config(
+            "structural",
+            "services:\n  db:\n    command: db\n  api:\n    command: api\n    depends_on: [db]\n",
+        );
+        let edited = path.clone();
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                std::fs::write(
+                    &edited,
+                    "services:\n  db:\n    command: db\n  api:\n    command: api\n",
+                )
+                .expect("edit the config");
+
+                let refused = stack
+                    .command(restart("api"))
+                    .await
+                    .expect_err("a changed depends_on is not this command's to adopt");
+                assert!(refused.contains("bounce the stack"), "got: {refused}");
+                assert!(stack.stops().is_empty(), "nothing may have been stopped");
+                assert_eq!(stack.row("api").status, "running");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn a_config_that_no_longer_parses_leaves_the_service_running() {
+        let path = temp_config("unreadable", "services:\n  api:\n    command: first\n");
+        let edited = path.clone();
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                std::fs::write(&edited, "services: [not a mapping\n").expect("edit the config");
+
+                let refused = stack
+                    .command(restart("api"))
+                    .await
+                    .expect_err("a config that cannot be read cannot be started from");
+                assert!(refused.contains("cannot read"), "got: {refused}");
+                assert!(stack.stops().is_empty(), "nothing may have been stopped");
+                assert_eq!(stack.row("api").status, "running");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
     }
 
     /// Deliberate stops are the exception; a service ending on its own still

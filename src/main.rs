@@ -112,14 +112,14 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_current_dir(&workspace)
                 .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", workspace.display()))?;
             let config = config::ArigConfig::load(&cli.file)?;
-            supervisor::up(config, true).await
+            supervisor::up(config, Some(cli.file), true).await
         }
         Commands::Up { detach } => {
             let config = config::ArigConfig::load(&cli.file)?;
             if detach {
                 supervisor::detach_and_exit(&cli.file).await
             } else {
-                supervisor::up(config, false).await
+                supervisor::up(config, Some(cli.file), false).await
             }
         }
         Commands::Down => {

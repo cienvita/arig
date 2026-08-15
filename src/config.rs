@@ -54,7 +54,7 @@ pub enum ServiceType {
     Oneshot,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ServiceConfig {
     /// Which runtime runs this service. `process` runs it via the system
     /// shell; `docker` runs it as a container.
@@ -93,7 +93,7 @@ pub struct ServiceConfig {
 }
 
 /// Shutdown hook configuration for a service.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShutdownConfig {
     /// Command to run to stop the service.
     pub command: String,
