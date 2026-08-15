@@ -66,6 +66,21 @@ pub enum Event {
     ServiceReady {
         name: String,
     },
+    /// A service was asked to start again after being stopped. Carried
+    /// separately from ServiceStarted, which only follows once it has spawned:
+    /// a runtime that has an image to pull first can sit here for a while.
+    StartRequested {
+        name: String,
+    },
+    /// A service was asked to stop on its own. What makes the exit that
+    /// follows deliberate rather than a service dying.
+    StopRequested {
+        name: String,
+    },
+    /// A service the supervisor stopped on purpose is gone.
+    ServiceStopped {
+        name: String,
+    },
     OneshotCompleted {
         name: String,
         success: bool,

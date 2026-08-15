@@ -16,6 +16,49 @@ pub enum Startup {
     Failed(String),
 }
 
+/// Where a service is in its lifecycle. Rendered into the wire `status`
+/// string, which older clients read as free-form text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    /// Spawning, or waiting on whatever the runtime has to do first.
+    Starting,
+    Running,
+    Stopping,
+    /// Stopped because it was asked to be.
+    Stopped,
+    /// Gone on its own, worded by the runtime that ran it.
+    Exited(String),
+}
+
+impl ServiceState {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ServiceState::Starting => "starting",
+            ServiceState::Running => protocol::RUNNING,
+            ServiceState::Stopping => "stopping",
+            ServiceState::Stopped => "stopped",
+            ServiceState::Exited(status) => status,
+        }
+    }
+}
+
+/// What the operator asked for, as opposed to what is true. Without it a
+/// service that was stopped on purpose and one that died look the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Desired {
+    Up,
+    Stopped,
+}
+
+impl Desired {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Desired::Up => "up",
+            Desired::Stopped => "stopped",
+        }
+    }
+}
+
 /// One tracked service. `arig ps` renders this, but the row holds a little
 /// more than the wire carries: uptime is an instant here and seconds there.
 struct Row {
@@ -23,7 +66,8 @@ struct Row {
     kind: String,
     wave: usize,
     pid: Option<u32>,
-    status: String,
+    state: ServiceState,
+    desired: Desired,
     ready: Readiness,
     restarts: u64,
     /// When the current instance started, and `None` once it is gone.
@@ -63,7 +107,8 @@ impl StateTracker {
                 kind: row.kind.clone(),
                 wave: row.wave,
                 pid: row.pid,
-                status: row.status.clone(),
+                status: row.state.as_str().to_string(),
+                desired: Some(row.desired.as_str().to_string()),
                 ready: row.ready,
                 restarts: row.restarts,
                 uptime_secs: row.started_at.map(|t| t.elapsed().as_secs()),
@@ -83,6 +128,13 @@ impl StateTracker {
             *current = outcome;
             true
         });
+    }
+
+    /// How startup ended so far, without blocking. A lifecycle command needs
+    /// it: the kernel only drains its command channel once it is past startup,
+    /// so a command sent before that would hang rather than be refused.
+    pub fn startup(&self) -> Startup {
+        self.startup.borrow().clone()
     }
 
     /// Block until startup has settled. Returns immediately for a caller that
@@ -126,7 +178,8 @@ impl StateTracker {
                         row.kind = kind.as_str().to_string();
                         row.wave = *wave;
                         row.pid = *pid;
-                        row.status = protocol::RUNNING.to_string();
+                        row.state = ServiceState::Running;
+                        row.desired = Desired::Up;
                         row.ready = ready;
                         row.started_at = Some(Instant::now());
                         row.depends_on = depends_on.clone();
@@ -136,12 +189,35 @@ impl StateTracker {
                         kind: kind.as_str().to_string(),
                         wave: *wave,
                         pid: *pid,
-                        status: protocol::RUNNING.to_string(),
+                        state: ServiceState::Running,
+                        desired: Desired::Up,
                         ready,
                         restarts: 0,
                         started_at: Some(Instant::now()),
                         depends_on: depends_on.clone(),
                     }),
+                }
+            }
+            Event::StartRequested { name } => {
+                if let Some(row) = services.iter_mut().find(|s| &s.name == name) {
+                    row.state = ServiceState::Starting;
+                    row.desired = Desired::Up;
+                }
+            }
+            Event::StopRequested { name } => {
+                if let Some(row) = services.iter_mut().find(|s| &s.name == name) {
+                    row.state = ServiceState::Stopping;
+                    row.desired = Desired::Stopped;
+                }
+            }
+            Event::ServiceStopped { name } => {
+                if let Some(row) = services.iter_mut().find(|s| &s.name == name) {
+                    row.state = ServiceState::Stopped;
+                    row.pid = None;
+                    row.started_at = None;
+                    // Whatever the probe last said is about an instance that
+                    // is gone.
+                    row.ready = Readiness::Unchecked;
                 }
             }
             Event::ServiceReady { name } => {
@@ -156,7 +232,7 @@ impl StateTracker {
             }
             Event::ServiceExited { name, status } => {
                 if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
-                    service.status = status.clone();
+                    service.state = ServiceState::Exited(status.clone());
                     service.started_at = None;
                 }
             }
@@ -309,6 +385,34 @@ mod tests {
         });
 
         assert_eq!(tracker.snapshot().len(), 1);
+    }
+
+    /// A service stopped on purpose and one that died have to look different;
+    /// that is what desired state is for.
+    #[test]
+    fn a_deliberate_stop_is_told_apart_from_a_service_that_died() {
+        let tracker = StateTracker::default();
+        tracker.apply(&started("api", 0, ServiceKind::Service, 22));
+        tracker.apply(&started("db", 0, ServiceKind::Service, 23));
+
+        tracker.apply(&Event::StopRequested {
+            name: "api".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].status, "stopping");
+        tracker.apply(&Event::ServiceStopped {
+            name: "api".to_string(),
+        });
+        tracker.apply(&Event::ServiceExited {
+            name: "db".to_string(),
+            status: "exit code 1".to_string(),
+        });
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot[0].status, "stopped");
+        assert_eq!(snapshot[0].desired.as_deref(), Some("stopped"));
+        assert_eq!(snapshot[0].uptime_secs, None);
+        assert_eq!(snapshot[1].status, "exit code 1");
+        assert_eq!(snapshot[1].desired.as_deref(), Some("up"));
     }
 
     /// A restarted service is the same service. A second row would show up in

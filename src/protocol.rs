@@ -14,6 +14,23 @@ pub enum Request {
     Wait,
     /// Trigger supervisor shutdown.
     Down,
+    /// Stop one service and leave the rest alone. The supervisor holds the
+    /// connection until the service is gone.
+    Stop { service: String },
+    /// Start one service that is not running. Held until its readiness probe
+    /// passes unless `no_wait` says otherwise.
+    Start {
+        service: String,
+        /// Defaulted so a flag added later still parses on both ends.
+        #[serde(default)]
+        no_wait: bool,
+    },
+    /// Stop and start one service, in one command.
+    Restart {
+        service: String,
+        #[serde(default)]
+        no_wait: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +82,10 @@ pub struct ServiceSnapshot {
     /// defaulted for the same reason.
     #[serde(default)]
     pub ready: Readiness,
+    /// What the operator asked for: "up" or "stopped". Absent from a
+    /// supervisor that has no notion of it.
+    #[serde(default)]
+    pub desired: Option<String>,
     /// How many times this service has been started again since the stack
     /// came up.
     #[serde(default)]
@@ -139,6 +160,31 @@ mod tests {
         assert_eq!(services[0].restarts, 0);
         assert_eq!(services[0].uptime_secs, None);
         assert!(services[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn a_lifecycle_request_names_its_service_on_the_wire() {
+        let json = serde_json::to_string(&Request::Restart {
+            service: "api".to_string(),
+            no_wait: true,
+        })
+        .expect("serialize");
+
+        assert_eq!(json, r#"{"op":"restart","service":"api","no_wait":true}"#);
+    }
+
+    /// The flags are defaulted so that a client sending only what it knows
+    /// about still parses, whichever end is newer.
+    #[test]
+    fn a_lifecycle_request_without_flags_parses() {
+        let req: Request =
+            serde_json::from_str(r#"{"op":"start","service":"api"}"#).expect("parse");
+
+        let Request::Start { service, no_wait } = req else {
+            panic!("expected a start request, got {req:?}");
+        };
+        assert_eq!(service, "api");
+        assert!(!no_wait);
     }
 
     #[test]
