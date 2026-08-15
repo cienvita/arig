@@ -88,6 +88,17 @@ impl RunningService for ProcessChild {
         Ok(self.child.wait().await?.into())
     }
 
+    async fn try_exit(&mut self) -> Option<Exit> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.into()),
+            Ok(None) => None,
+            Err(e) => {
+                event!(self.bus, "arig: cannot check on '{}' ({e})", self.name);
+                None
+            }
+        }
+    }
+
     fn begin_stop(&mut self) {
         // A hooked service is stopped by running its hook, which happens in
         // finish_stop; signalling it here would race that.

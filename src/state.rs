@@ -1,18 +1,74 @@
 use crate::event::{Bus, Event};
-use crate::protocol::ServiceSnapshot;
+use crate::protocol::{Readiness, ServiceSnapshot};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
+
+/// How startup ended. `arig wait` blocks until this settles, so the failed
+/// case carries the reason: the client has no terminal output to read, and an
+/// exiting supervisor would otherwise leave it with a closed connection and
+/// nothing to report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Startup {
+    Pending,
+    Ready,
+    Failed(String),
+}
 
 /// What `arig ps` reports, derived from the event stream so the bus stays the
 /// only record of service state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StateTracker {
     services: Arc<Mutex<Vec<ServiceSnapshot>>>,
+    /// Settles once the kernel knows how startup ended. Set by the kernel
+    /// rather than derived from the bus: a waiter must not be answered before
+    /// the exits that decide the verdict have been applied, and events reach
+    /// the tracker on a task of their own.
+    startup: Arc<watch::Sender<Startup>>,
+}
+
+impl Default for StateTracker {
+    fn default() -> Self {
+        Self {
+            services: Arc::default(),
+            startup: Arc::new(watch::channel(Startup::Pending).0),
+        }
+    }
 }
 
 impl StateTracker {
     pub fn snapshot(&self) -> Vec<ServiceSnapshot> {
         self.services.lock().expect("state mutex poisoned").clone()
+    }
+
+    /// Record how startup ended. The first verdict wins: a service that dies
+    /// after the stack came up is a running stack that failed, not a startup
+    /// that did, and a waiter has already been told it was ready.
+    pub fn finish_startup(&self, outcome: Startup) {
+        self.startup.send_if_modified(|current| {
+            if *current != Startup::Pending {
+                return false;
+            }
+            *current = outcome;
+            true
+        });
+    }
+
+    /// Block until startup has settled. Returns immediately for a caller that
+    /// arrives after the fact, so a late `arig wait` still gets the verdict.
+    pub async fn wait_startup(&self) -> Startup {
+        let mut rx = self.startup.subscribe();
+        loop {
+            {
+                let current = rx.borrow_and_update();
+                if *current != Startup::Pending {
+                    return current.clone();
+                }
+            }
+            if rx.changed().await.is_err() {
+                return Startup::Failed("supervisor stopped".to_string());
+            }
+        }
     }
 
     pub fn apply(&self, event: &Event) {
@@ -23,13 +79,24 @@ impl StateTracker {
                 wave,
                 kind,
                 pid,
+                probed,
             } => services.push(ServiceSnapshot {
                 name: name.clone(),
                 kind: kind.as_str().to_string(),
                 wave: *wave,
                 pid: *pid,
                 status: "running".to_string(),
+                ready: if *probed {
+                    Readiness::Pending
+                } else {
+                    Readiness::Unchecked
+                },
             }),
+            Event::ServiceReady { name } => {
+                if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
+                    service.ready = Readiness::Ready;
+                }
+            }
             // A failed oneshot keeps its row: the supervisor is about to shut
             // everything down and the row is what `arig ps` shows meanwhile.
             Event::OneshotCompleted { name, success } if *success => {
@@ -77,6 +144,17 @@ mod tests {
             wave,
             kind,
             pid: Some(pid),
+            probed: false,
+        }
+    }
+
+    fn probed(name: &str) -> Event {
+        Event::ServiceStarted {
+            name: name.to_string(),
+            wave: 0,
+            kind: ServiceKind::Service,
+            pid: Some(33),
+            probed: true,
         }
     }
 
@@ -98,6 +176,71 @@ mod tests {
         assert_eq!(snapshot[0].wave, 1);
         assert_eq!(snapshot[0].pid, Some(22));
         assert_eq!(snapshot[0].status, "running");
+        assert_eq!(snapshot[0].ready, Readiness::Unchecked);
+    }
+
+    #[test]
+    fn a_probed_service_is_pending_until_its_probe_passes() {
+        let tracker = StateTracker::default();
+
+        tracker.apply(&probed("db"));
+        assert_eq!(tracker.snapshot()[0].ready, Readiness::Pending);
+
+        tracker.apply(&Event::ServiceReady {
+            name: "db".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].ready, Readiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_blocks_until_the_kernel_records_a_verdict() {
+        let tracker = StateTracker::default();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_startup().await }
+        });
+
+        // Service state moving on its own is not a verdict.
+        tracker.apply(&probed("db"));
+        tracker.apply(&Event::ServiceReady {
+            name: "db".to_string(),
+        });
+        assert!(!waiter.is_finished());
+
+        tracker.finish_startup(Startup::Ready);
+        assert_eq!(waiter.await.expect("waiter task"), Startup::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_late_waiter_still_gets_the_verdict() {
+        let tracker = StateTracker::default();
+        // Nothing is subscribed at this point, which is the ordinary case:
+        // `arig wait` usually connects after the supervisor has settled.
+        tracker.finish_startup(Startup::Ready);
+
+        assert_eq!(tracker.wait_startup().await, Startup::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_failed_startup_carries_its_reason() {
+        let tracker = StateTracker::default();
+        tracker.finish_startup(Startup::Failed("probe gave up".to_string()));
+
+        assert_eq!(
+            tracker.wait_startup().await,
+            Startup::Failed("probe gave up".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_dying_after_startup_does_not_rewrite_the_verdict() {
+        let tracker = StateTracker::default();
+        tracker.finish_startup(Startup::Ready);
+        // The stack came up and then broke. `arig wait` has already been
+        // answered, and startup is not retroactively a failure.
+        tracker.finish_startup(Startup::Failed("too late".to_string()));
+
+        assert_eq!(tracker.wait_startup().await, Startup::Ready);
     }
 
     #[test]

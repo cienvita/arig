@@ -31,6 +31,44 @@ pub async fn down(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Block until the supervisor reports every wave up and every probe passed.
+pub async fn wait(workspace: &Path, timeout: Duration) -> Result<()> {
+    let endpoint = ipc::Endpoint::for_workspace(workspace)?;
+    let stream = ipc::connect(&endpoint)
+        .await
+        .with_context(|| format!("no supervisor at {}", endpoint.address))?;
+
+    // The supervisor holds the connection until it is up, so the timeout is
+    // on the exchange rather than on a poll loop.
+    let log = supervisor_log(workspace);
+    let resp = match tokio::time::timeout(timeout, protocol::exchange(stream, &Request::Wait)).await
+    {
+        // A supervisor that dies outright answers nothing, so the reason for
+        // it is only in its log.
+        Ok(resp) => resp.with_context(|| format!("check {} for details", log.display()))?,
+        Err(_) => anyhow::bail!(
+            "services were not ready within {}",
+            humantime::format_duration(timeout)
+        ),
+    };
+    if !resp.ok {
+        anyhow::bail!(
+            "wait: {}. check {} for details",
+            resp.error.unwrap_or_else(|| "unknown".into()),
+            log.display(),
+        );
+    }
+    println!("arig: ready");
+    Ok(())
+}
+
+/// Where a detached supervisor's own output goes. Fixed rather than read from
+/// the config, since it holds whatever a supervisor printed before its
+/// configured logging was up.
+fn supervisor_log(workspace: &Path) -> std::path::PathBuf {
+    workspace.join(".arig/var/supervisor.log")
+}
+
 pub async fn ps(workspace: &Path) -> Result<()> {
     let endpoint = ipc::Endpoint::for_workspace(workspace)?;
     let stream = ipc::connect(&endpoint)
@@ -69,7 +107,7 @@ fn print_ps(services: &[protocol::ServiceSnapshot]) {
         .max(6);
 
     println!(
-        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}",
+        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  READY",
         "NAME", "WAVE", "PID", "KIND", "STATUS",
     );
     for s in services {
@@ -78,8 +116,13 @@ fn print_ps(services: &[protocol::ServiceSnapshot]) {
             None => "-".to_string(),
         };
         println!(
-            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}",
-            s.name, s.wave, pid, s.kind, s.status,
+            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {}",
+            s.name,
+            s.wave,
+            pid,
+            s.kind,
+            s.status,
+            s.ready.as_str(),
         );
     }
 }

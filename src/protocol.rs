@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 pub enum Request {
     /// List currently-tracked services.
     Ps,
+    /// Block until every wave is up and every readiness probe has passed.
+    /// The supervisor holds the connection open until then.
+    Wait,
     /// Trigger supervisor shutdown.
     Down,
 }
@@ -56,6 +59,34 @@ pub struct ServiceSnapshot {
     /// Absent for a runtime whose services are not host processes.
     pub pid: Option<u32>,
     pub status: String,
+    /// Defaulted rather than required: a detached supervisor outlives an
+    /// upgrade, so a newer `arig ps` has to read a response from an older
+    /// supervisor that has no readiness to report.
+    #[serde(default)]
+    pub ready: Readiness,
+}
+
+/// Where a service is against its readiness probe. Separate from `status`,
+/// which reports the process: a service can be running and not yet ready.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Readiness {
+    /// No probe gates this service, so there is nothing to wait for. Also
+    /// what a supervisor too old to report readiness degrades to.
+    #[default]
+    Unchecked,
+    Pending,
+    Ready,
+}
+
+impl Readiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readiness::Unchecked => "-",
+            Readiness::Pending => "pending",
+            Readiness::Ready => "ready",
+        }
+    }
 }
 
 pub async fn read_request<R: AsyncRead + Unpin>(reader: R) -> Result<Request> {
@@ -73,6 +104,30 @@ pub async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, resp: &Respon
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A detached supervisor outlives an upgrade of the binary, so a newer
+    /// `arig ps` has to read a response written by an older supervisor.
+    #[test]
+    fn a_response_from_before_readiness_still_parses() {
+        let older = r#"{"ok":true,"services":[
+            {"name":"api","kind":"service","wave":0,"pid":22,"status":"running"}
+        ]}"#;
+
+        let resp: Response = serde_json::from_str(older).expect("an older response must parse");
+        let services = resp.services.expect("the response carries services");
+        assert_eq!(services[0].ready, Readiness::Unchecked);
+    }
+
+    #[test]
+    fn readiness_goes_over_the_wire_lowercased() {
+        let json = serde_json::to_string(&Readiness::Pending).expect("serialize");
+        assert_eq!(json, r#""pending""#);
+    }
+}
+
 /// Client helper: send a request on the stream and read back the response.
 pub async fn exchange<S>(stream: S, req: &Request) -> Result<Response>
 where
@@ -86,6 +141,10 @@ where
 
     let mut br = BufReader::new(rd);
     let mut line = String::new();
-    br.read_line(&mut line).await.context("read response")?;
+    // A supervisor that exits mid-request closes the stream instead of
+    // answering, which reads as EOF rather than as a parse failure.
+    if br.read_line(&mut line).await.context("read response")? == 0 {
+        anyhow::bail!("supervisor closed the connection without answering");
+    }
     serde_json::from_str(line.trim()).context("parse response")
 }

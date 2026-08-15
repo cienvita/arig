@@ -184,6 +184,7 @@ mod tests {
             wave: 0,
             kind: ServiceKind::Service,
             pid: Some(1),
+            probed: false,
         });
         bus.drain(&cursor, Duration::from_secs(5)).await;
 

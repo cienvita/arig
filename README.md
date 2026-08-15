@@ -34,6 +34,22 @@ Reads `arig.yaml` in the current directory. Example:
         working_dir: ./api
         depends_on: [migrate]
 
+## Commands
+
+`arig up -d` runs the supervisor in the background. It returns once the
+supervisor is accepting commands, which is before any service has started.
+
+`arig wait` blocks until every wave is up and every readiness probe has
+passed, then exits 0. It exits non-zero, reporting why, if a probe never
+passes, a oneshot fails, a service exits while the stack is still coming up,
+or the timeout (`--timeout`, default 2m) elapses first.
+
+`arig ps` lists what the supervisor is tracking. `STATUS` reports the process,
+`READY` reports the probe: a service is `running` and `pending` between
+starting and passing its probe, and `-` when no probe gates it.
+
+`arig down` stops everything.
+
 ## Runtimes
 
 `runtime:` picks what runs a service. It defaults to `process`.
