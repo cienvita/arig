@@ -87,7 +87,7 @@ Near-term:
 - [ ] Dynamic env injection from dependency metadata
 
 Command surface:
-- [ ] Implement `arig down`
+- [x] Implement `arig down`
 - [ ] `--format json` structured output
 - [ ] Single-service commands (`stop`, `start`, `restart`, `build`, `status`,
       `logs`, `env`), see [docs/service-lifecycle.md](docs/service-lifecycle.md)
