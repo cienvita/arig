@@ -74,6 +74,9 @@ struct InFlight {
     /// accepted rather than when the phase runs: a restart has to fail on a
     /// bad edit before it stops anything.
     spec: Option<ServiceConfig>,
+    /// What a build phase will run, read at the same point and for the same
+    /// reason.
+    build: Option<ServiceConfig>,
     /// The task running the current phase, if the phase has one.
     task: Option<Task>,
 }
@@ -634,6 +637,16 @@ impl Kernel {
                     Err(reason) => steady.settle(&name, Err(reason)),
                 }
             }
+            KernelMsg::BuildFinished { name, result } => {
+                steady.clear_task(&name);
+                match result {
+                    Ok(()) => self.advance(steady, &name).await,
+                    // Nothing else has happened yet: a restart that was going
+                    // to stop the service never gets that far, so a broken
+                    // edit leaves a working service running.
+                    Err(reason) => steady.settle(&name, Err(reason)),
+                }
+            }
         }
     }
 
@@ -645,16 +658,21 @@ impl Kernel {
         reply: oneshot::Sender<Result<(), String>>,
     ) {
         let name = req.service().to_string();
+        // Everything a command needs from the config is read here, while the
+        // running instance is still untouched, so a bad edit is refused
+        // rather than acted on halfway.
         let prepared = self.plan(steady, &req).and_then(|plan| {
-            // A command that will start the service reads its definition now,
-            // while the running instance is still untouched.
             let spec = match plan.contains(&Phase::Start) {
                 true => Some(self.prepare(&name)?),
                 false => None,
             };
-            Ok((plan, spec))
+            let build = match plan.contains(&Phase::Build) {
+                true => Some(self.build_of(&name)?),
+                false => None,
+            };
+            Ok((plan, spec, build))
         });
-        let (plan, spec) = match prepared {
+        let (plan, spec, build) = match prepared {
             Ok(prepared) => prepared,
             Err(reason) => {
                 let _ = reply.send(Err(reason));
@@ -669,6 +687,7 @@ impl Kernel {
                 no_wait: req.no_wait(),
                 plan,
                 spec,
+                build,
                 task: None,
             },
         );
@@ -698,13 +717,37 @@ impl Kernel {
             LifecycleReq::Stop { .. } => Ok(VecDeque::from([Phase::Stop])),
             LifecycleReq::Start { .. } if running => Err(format!("'{name}' is already running")),
             LifecycleReq::Start { .. } => Ok(VecDeque::from([Phase::Start])),
+            // Building a service that is up is the point of having the verb:
+            // build first, stop second, so the service is down for as little
+            // as possible.
+            LifecycleReq::Build { .. } => Ok(VecDeque::from([Phase::Build])),
             // A restart of something already stopped is a start: what was
             // asked for is that it ends up running.
-            LifecycleReq::Restart { .. } if running => {
-                Ok(VecDeque::from([Phase::Stop, Phase::Start]))
+            LifecycleReq::Restart { build, .. } => {
+                let mut plan = VecDeque::new();
+                if *build {
+                    plan.push_back(Phase::Build);
+                }
+                if running {
+                    plan.push_back(Phase::Stop);
+                }
+                plan.push_back(Phase::Start);
+                Ok(plan)
             }
-            LifecycleReq::Restart { .. } => Ok(VecDeque::from([Phase::Start])),
         }
+    }
+
+    /// The build a command would run, resolved through the service's runtime
+    /// so that what a build means stays the runtime's to decide.
+    fn build_of(&self, name: &str) -> Result<ServiceConfig, String> {
+        let spec = self.reload(name)?;
+        let runtime = self
+            .registry
+            .runtime(&spec.runtime)
+            .map_err(|err| err.to_string())?;
+        runtime
+            .build(&spec)
+            .ok_or_else(|| format!("'{name}' has no build: command"))
     }
 
     /// Read one service's definition again, so a start after an edit runs what
@@ -779,6 +822,10 @@ impl Kernel {
             };
 
             match phase {
+                Phase::Build => {
+                    self.build_phase(steady, name);
+                    return;
+                }
                 Phase::Stop => {
                     self.stop_phase(steady, name);
                     return;
@@ -799,6 +846,58 @@ impl Kernel {
                     }
                 },
             }
+        }
+    }
+
+    /// Hand a service's build to a task that runs it to completion. The
+    /// service itself is untouched: a build alongside a running instance is
+    /// the ordinary case.
+    fn build_phase(&self, steady: &mut Steady, name: &str) {
+        let plan = match steady
+            .inflight
+            .get_mut(name)
+            .and_then(|entry| entry.build.take())
+        {
+            Some(plan) => plan,
+            None => match self.build_of(name) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    steady.settle(name, Err(reason));
+                    return;
+                }
+            },
+        };
+        let runtime = match self.registry.runtime(&plan.runtime) {
+            Ok(runtime) => runtime.clone(),
+            Err(err) => {
+                steady.settle(name, Err(err.to_string()));
+                return;
+            }
+        };
+
+        self.bus.emit(Event::BuildStarted {
+            name: name.to_string(),
+        });
+        event!(self.bus, "arig: building '{name}'");
+
+        let bus = self.bus.clone();
+        let msg_tx = self.msg_tx.clone();
+        let building = name.to_string();
+        let task = tokio::spawn(async move {
+            let result = run_build(&bus, runtime.as_ref(), &building, &plan).await;
+            bus.emit(Event::BuildFinished {
+                name: building.clone(),
+            });
+            let _ = msg_tx
+                .send(KernelMsg::BuildFinished {
+                    name: building,
+                    result,
+                })
+                .await;
+        });
+
+        if let Some(entry) = steady.inflight.get_mut(name) {
+            entry.task = Some(Task::Work(task));
         }
     }
 
@@ -1047,8 +1146,20 @@ async fn handle_client(
             let req = LifecycleReq::Start { service, no_wait };
             let _ = protocol::write_response(&mut wr, &lifecycle(&state, &msg_tx, req).await).await;
         }
-        protocol::Request::Restart { service, no_wait } => {
-            let req = LifecycleReq::Restart { service, no_wait };
+        protocol::Request::Restart {
+            service,
+            build,
+            no_wait,
+        } => {
+            let req = LifecycleReq::Restart {
+                service,
+                build,
+                no_wait,
+            };
+            let _ = protocol::write_response(&mut wr, &lifecycle(&state, &msg_tx, req).await).await;
+        }
+        protocol::Request::Build { service } => {
+            let req = LifecycleReq::Build { service };
             let _ = protocol::write_response(&mut wr, &lifecycle(&state, &msg_tx, req).await).await;
         }
     }
@@ -1160,6 +1271,50 @@ async fn oneshot_heartbeat(bus: Bus, name: String, last_output: LastOutput) {
                 "arig: '{name}' still running (no output for {})",
                 humantime::format_duration(Duration::from_secs(silent.as_secs())),
             );
+        }
+    }
+}
+
+/// Run one build to completion. It gets the log plumbing and the heartbeat a
+/// oneshot gets, since it is one: a long quiet build must not read as hung,
+/// and its output belongs in the logs under the service's own name.
+async fn run_build(
+    bus: &Bus,
+    runtime: &dyn crate::runtime::Runtime,
+    name: &str,
+    plan: &ServiceConfig,
+) -> Result<(), String> {
+    let mut spawned = runtime
+        .spawn(name, plan)
+        .await
+        .map_err(|err| format!("cannot start the build for '{name}': {err}"))?;
+
+    let tail = logs::new_tail();
+    let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
+    let mut io_tasks = logs::pipe_output(&mut spawned, name, &tail, &last_output, bus);
+
+    let outcome = wait_oneshot(
+        bus,
+        name,
+        spawned.handle.as_mut(),
+        plan.timeout,
+        last_output.clone(),
+    )
+    .await;
+    drain_io(&mut io_tasks).await;
+
+    match outcome {
+        Ok(exit) if exit.success() => {
+            event!(bus, "arig: build for '{name}' finished");
+            Ok(())
+        }
+        Ok(exit) => {
+            dump_tail(bus, name, &tail);
+            Err(format!("build for '{name}' failed ({exit})"))
+        }
+        Err(err) => {
+            dump_tail(bus, name, &tail);
+            Err(err.to_string())
         }
     }
 }
@@ -1300,6 +1455,8 @@ mod tests {
         /// Parks every stop until a test releases it, so a command can be
         /// caught in flight.
         hold: Option<Arc<tokio::sync::Notify>>,
+        /// What every oneshot, builds included, exits with.
+        oneshot_exit: i64,
     }
 
     #[async_trait]
@@ -1314,9 +1471,10 @@ mod tests {
             self.spawns
                 .record(format!("{name} {}", spec.command.as_deref().unwrap_or("-")));
             // A oneshot has to end for the wave to move on, and a crasher has
-            // to end for the steady loop to notice it.
+            // to end for the steady loop to notice it. Builds arrive here as
+            // oneshots too, which is what oneshot_exit is for.
             let exits = (spec.service_type == ServiceType::Oneshot)
-                .then(|| Exit::from_code(0))
+                .then(|| Exit::from_code(self.oneshot_exit))
                 .or_else(|| (self.crashes.as_deref() == Some(name)).then(|| Exit::from_code(1)));
             Ok(SpawnedService {
                 handle: Box::new(FakeService {
@@ -1432,6 +1590,7 @@ mod tests {
         ServiceConfig {
             runtime: DEFAULT_RUNTIME.to_string(),
             command: Some("never run: the fake runtime ignores it".to_string()),
+            build: None,
             image: None,
             ports: Vec::new(),
             service_type: ServiceType::Service,
@@ -1469,6 +1628,8 @@ mod tests {
         oneshots: Vec<String>,
         /// Config file to run from, for the tests that edit one mid-run.
         config_file: Option<std::path::PathBuf>,
+        /// What every oneshot, builds included, exits with.
+        oneshot_exit: i64,
         /// Parks every stop until the test releases it.
         hold: Option<Arc<tokio::sync::Notify>>,
     }
@@ -1535,6 +1696,7 @@ mod tests {
             dies_during_startup: setup.dies_during_startup,
             crashes: setup.crashes,
             hold: setup.hold,
+            oneshot_exit: setup.oneshot_exit,
         }));
         let ready = setup.probe.is_some();
         if let Some(probe) = setup.probe {
@@ -1710,7 +1872,22 @@ mod tests {
     fn restart(service: &str) -> LifecycleReq {
         LifecycleReq::Restart {
             service: service.to_string(),
+            build: false,
             no_wait: false,
+        }
+    }
+
+    fn rebuild_and_restart(service: &str) -> LifecycleReq {
+        LifecycleReq::Restart {
+            service: service.to_string(),
+            build: true,
+            no_wait: false,
+        }
+    }
+
+    fn build_only(service: &str) -> LifecycleReq {
+        LifecycleReq::Build {
+            service: service.to_string(),
         }
     }
 
@@ -2200,6 +2377,117 @@ mod tests {
                     .expect_err("a config that cannot be read cannot be started from");
                 assert!(refused.contains("cannot read"), "got: {refused}");
                 assert!(stack.stops().is_empty(), "nothing may have been stopped");
+                assert_eq!(stack.row("api").status, "running");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn a_build_runs_the_build_command_and_leaves_the_service_alone() {
+        let path = temp_config(
+            "build",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                stack.command(build_only("api")).await.expect("build 'api'");
+
+                assert_eq!(stack.spawns(), ["api run", "api make"]);
+                assert!(stack.stops().is_empty(), "a build stops nothing");
+                assert_eq!(stack.row("api").status, "running");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// The reason to build before stopping: a broken edit must not take a
+    /// working service down.
+    #[tokio::test]
+    async fn a_failed_build_leaves_the_running_instance_untouched() {
+        let path = temp_config(
+            "build-fails",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                oneshot_exit: 1,
+                ..Setup::default()
+            },
+            async |stack| {
+                let failed = stack
+                    .command(rebuild_and_restart("api"))
+                    .await
+                    .expect_err("a build that fails fails the command");
+                assert!(failed.contains("build for 'api' failed"), "got: {failed}");
+
+                assert!(stack.stops().is_empty(), "nothing may have been stopped");
+                assert_eq!(stack.spawns(), ["api run", "api make"]);
+                assert_eq!(stack.row("api").status, "running");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn a_service_with_no_build_command_cannot_be_built() {
+        let path = temp_config("no-build", "services:\n  api:\n    command: run\n");
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                let refused = stack
+                    .command(build_only("api"))
+                    .await
+                    .expect_err("there is nothing to build");
+                assert!(refused.contains("has no build"), "got: {refused}");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_build_builds_before_it_stops() {
+        let path = temp_config(
+            "build-restart",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                stack
+                    .command(rebuild_and_restart("api"))
+                    .await
+                    .expect("restart 'api' after building it");
+
+                assert_eq!(stack.spawns(), ["api run", "api make", "api run"]);
+                assert_eq!(stack.stops(), ["begin api", "finish api"]);
                 assert_eq!(stack.row("api").status, "running");
             },
         )

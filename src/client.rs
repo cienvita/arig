@@ -92,11 +92,13 @@ pub async fn start(
 pub async fn restart(
     workspace: &Path,
     service: &str,
+    build: bool,
     no_wait: bool,
     timeout: Duration,
 ) -> Result<()> {
     let req = Request::Restart {
         service: service.to_string(),
+        build,
         no_wait,
     };
     lifecycle(
@@ -105,6 +107,20 @@ pub async fn restart(
         timeout,
         "restart",
         &started(service, no_wait),
+    )
+    .await
+}
+
+pub async fn build(workspace: &Path, service: &str, timeout: Duration) -> Result<()> {
+    let req = Request::Build {
+        service: service.to_string(),
+    };
+    lifecycle(
+        workspace,
+        req,
+        timeout,
+        "build",
+        &format!("'{service}' built"),
     )
     .await
 }

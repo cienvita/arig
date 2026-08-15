@@ -343,6 +343,7 @@ mod tests {
         ServiceConfig {
             runtime: NAME.to_string(),
             command: Some(command.to_string()),
+            build: None,
             image: None,
             ports: Vec::new(),
             service_type,

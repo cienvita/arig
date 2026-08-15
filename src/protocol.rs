@@ -28,9 +28,15 @@ pub enum Request {
     /// Stop and start one service, in one command.
     Restart {
         service: String,
+        /// Run the service's build first, and leave the running instance
+        /// alone if it fails.
+        #[serde(default)]
+        build: bool,
         #[serde(default)]
         no_wait: bool,
     },
+    /// Run one service's build, without touching what is running.
+    Build { service: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,11 +172,15 @@ mod tests {
     fn a_lifecycle_request_names_its_service_on_the_wire() {
         let json = serde_json::to_string(&Request::Restart {
             service: "api".to_string(),
-            no_wait: true,
+            build: true,
+            no_wait: false,
         })
         .expect("serialize");
 
-        assert_eq!(json, r#"{"op":"restart","service":"api","no_wait":true}"#);
+        assert_eq!(
+            json,
+            r#"{"op":"restart","service":"api","build":true,"no_wait":false}"#
+        );
     }
 
     /// The flags are defaulted so that a client sending only what it knows

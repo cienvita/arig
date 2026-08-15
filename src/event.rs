@@ -81,6 +81,18 @@ pub enum Event {
     ServiceStopped {
         name: String,
     },
+    /// A service's build has started. Builds run against a service that is
+    /// still up as readily as against a stopped one, which is the point:
+    /// build first, stop second.
+    BuildStarted {
+        name: String,
+    },
+    /// A service's build has ended. Whether it worked is the command's answer
+    /// to its client and a line in the log; the state machine only needs to
+    /// know the build is over.
+    BuildFinished {
+        name: String,
+    },
     OneshotCompleted {
         name: String,
         success: bool,

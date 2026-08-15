@@ -63,6 +63,10 @@ pub struct ServiceConfig {
     /// Command line to execute. Required by the `process` runtime. On
     /// `docker` it overrides the image's command, and may be omitted.
     pub command: Option<String>,
+    /// Command that rebuilds this service; run by `arig build` and
+    /// `arig restart --build`. Runs on the host through the system shell, in
+    /// working_dir with env, whatever the runtime.
+    pub build: Option<String>,
     /// Container image. Required by the `docker` runtime, ignored otherwise.
     pub image: Option<String>,
     /// Ports to publish, as "host:container" or a bare port for both.

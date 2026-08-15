@@ -74,10 +74,22 @@ enum Commands {
     Restart {
         /// Service to restart
         service: String,
+        /// Run the service's build first; a build that fails leaves the
+        /// running instance alone
+        #[arg(long)]
+        build: bool,
         /// Return once it has spawned, without waiting for its readiness probe
         #[arg(long)]
         no_wait: bool,
         /// Give up waiting for it to be ready after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
+    /// Run one service's build, leaving what is running alone
+    Build {
+        /// Service to build
+        service: String,
+        /// Give up waiting for the build after this long, e.g. "30s", "5m"
         #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
         timeout: std::time::Duration,
     },
@@ -148,11 +160,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Restart {
             service,
+            build,
             no_wait,
             timeout,
         } => {
             let cwd = std::env::current_dir()?;
-            client::restart(&cwd, &service, no_wait, timeout).await
+            client::restart(&cwd, &service, build, no_wait, timeout).await
+        }
+        Commands::Build { service, timeout } => {
+            let cwd = std::env::current_dir()?;
+            client::build(&cwd, &service, timeout).await
         }
     }
 }

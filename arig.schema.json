@@ -56,6 +56,13 @@
     "ServiceConfig": {
       "type": "object",
       "properties": {
+        "build": {
+          "description": "Command that rebuilds this service; run by `arig build` and\n`arig restart --build`. Runs on the host through the system shell, in\nworking_dir with env, whatever the runtime.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "command": {
           "description": "Command line to execute. Required by the `process` runtime. On\n`docker` it overrides the image's command, and may be omitted.",
           "type": [

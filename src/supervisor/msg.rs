@@ -7,9 +7,21 @@ use tokio::sync::oneshot;
 /// `Request` so the kernel's vocabulary is not the protocol's, and closed on
 /// purpose: a new verb is a new variant.
 pub enum LifecycleReq {
-    Stop { service: String },
-    Start { service: String, no_wait: bool },
-    Restart { service: String, no_wait: bool },
+    Stop {
+        service: String,
+    },
+    Start {
+        service: String,
+        no_wait: bool,
+    },
+    Restart {
+        service: String,
+        build: bool,
+        no_wait: bool,
+    },
+    Build {
+        service: String,
+    },
 }
 
 impl LifecycleReq {
@@ -17,7 +29,8 @@ impl LifecycleReq {
         match self {
             LifecycleReq::Stop { service }
             | LifecycleReq::Start { service, .. }
-            | LifecycleReq::Restart { service, .. } => service,
+            | LifecycleReq::Restart { service, .. }
+            | LifecycleReq::Build { service } => service,
         }
     }
 
@@ -25,16 +38,17 @@ impl LifecycleReq {
     /// rather than once its readiness probe has passed.
     pub fn no_wait(&self) -> bool {
         match self {
-            LifecycleReq::Stop { .. } => false,
+            LifecycleReq::Stop { .. } | LifecycleReq::Build { .. } => false,
             LifecycleReq::Start { no_wait, .. } | LifecycleReq::Restart { no_wait, .. } => *no_wait,
         }
     }
 }
 
 /// One step of a lifecycle command. A command is a sequence of these, so
-/// restart is stop then start rather than a case of its own.
+/// restart is build, stop and start rather than a case of its own.
 #[derive(PartialEq, Eq)]
 pub enum Phase {
+    Build,
     Stop,
     Start,
 }
@@ -53,6 +67,11 @@ pub enum KernelMsg {
     StopFinished { name: String },
     /// A readiness probe the kernel started has passed or given up.
     ProbeSettled {
+        name: String,
+        result: Result<(), String>,
+    },
+    /// A build the kernel started has ended.
+    BuildFinished {
         name: String,
         result: Result<(), String>,
     },

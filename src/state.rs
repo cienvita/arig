@@ -26,6 +26,9 @@ pub enum ServiceState {
     Stopping,
     /// Stopped because it was asked to be.
     Stopped,
+    /// Being rebuilt, with nothing of it running. A build alongside a running
+    /// instance leaves the service running, since it is.
+    Building,
     /// Gone on its own, worded by the runtime that ran it.
     Exited(String),
 }
@@ -37,6 +40,7 @@ impl ServiceState {
             ServiceState::Running => protocol::RUNNING,
             ServiceState::Stopping => "stopping",
             ServiceState::Stopped => "stopped",
+            ServiceState::Building => "building",
             ServiceState::Exited(status) => status,
         }
     }
@@ -229,6 +233,22 @@ impl StateTracker {
             // everything down and the row is what `arig ps` shows meanwhile.
             Event::OneshotCompleted { name, success } if *success => {
                 services.retain(|s| &s.name != name)
+            }
+            // Only a service with nothing running has anything to show for a
+            // build; one that is up stays up while it builds.
+            Event::BuildStarted { name } => {
+                if let Some(row) = services.iter_mut().find(|s| &s.name == name)
+                    && row.state == ServiceState::Stopped
+                {
+                    row.state = ServiceState::Building;
+                }
+            }
+            Event::BuildFinished { name } => {
+                if let Some(row) = services.iter_mut().find(|s| &s.name == name)
+                    && row.state == ServiceState::Building
+                {
+                    row.state = ServiceState::Stopped;
+                }
             }
             Event::ServiceExited { name, status } => {
                 if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
