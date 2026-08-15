@@ -89,7 +89,8 @@ Near-term:
 Command surface:
 - [ ] Implement `arig down`
 - [ ] `--format json` structured output
-- [ ] Single-service commands (`status`, `logs`, `env`, `restart`, `build`)
+- [ ] Single-service commands (`stop`, `start`, `restart`, `build`, `status`,
+      `logs`, `env`), see [docs/service-lifecycle.md](docs/service-lifecycle.md)
 
 Plugin platform:
 - [x] Docker runtime via bollard
