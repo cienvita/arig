@@ -55,7 +55,17 @@ pub enum Event {
         kind: ServiceKind,
         /// The host pid, when the runtime has one. A container does not.
         pid: Option<u32>,
+        /// Whether a readiness probe gates this service. Started is not ready
+        /// when one does, and subscribers have no other way to tell.
+        probed: bool,
     },
+    /// A service's readiness probe passed.
+    ServiceReady {
+        name: String,
+    },
+    /// Every wave is up: each oneshot ran and each probe passed. The last
+    /// thing the startup path reports before it starts waiting on services.
+    StartupComplete,
     OneshotCompleted {
         name: String,
         success: bool,

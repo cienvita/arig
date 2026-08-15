@@ -35,7 +35,9 @@ enum Commands {
     Init,
     /// Build and start all services
     Up {
-        /// Run the supervisor in the background; the CLI returns once it is ready.
+        /// Run the supervisor in the background; the CLI returns once the
+        /// supervisor is accepting commands, not once the services are ready.
+        /// Use `arig wait` for that.
         #[arg(short = 'd', long = "detach")]
         detach: bool,
     },
@@ -43,6 +45,12 @@ enum Commands {
     Down,
     /// List services tracked by the supervisor for this workspace
     Ps,
+    /// Block until every service has started and every readiness probe passed
+    Wait {
+        /// Give up after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
     /// Print the JSON schema for arig.yaml to stdout
     Schema,
     /// Internal: act as a workspace supervisor. Spawned by `arig up --detach`.
@@ -74,14 +82,14 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_current_dir(&workspace)
                 .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", workspace.display()))?;
             let config = config::ArigConfig::load(&cli.file)?;
-            supervisor::up(config).await
+            supervisor::up(config, true).await
         }
         Commands::Up { detach } => {
             let config = config::ArigConfig::load(&cli.file)?;
             if detach {
                 supervisor::detach_and_exit(&cli.file).await
             } else {
-                supervisor::up(config).await
+                supervisor::up(config, false).await
             }
         }
         Commands::Down => {
@@ -91,6 +99,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ps => {
             let cwd = std::env::current_dir()?;
             client::ps(&cwd).await
+        }
+        Commands::Wait { timeout } => {
+            let cwd = std::env::current_dir()?;
+            client::wait(&cwd, timeout).await
         }
     }
 }

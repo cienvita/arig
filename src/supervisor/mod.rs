@@ -60,9 +60,12 @@ struct Kernel {
     bus: Bus,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     registry: Registry,
+    /// Whether this supervisor was spawned by `up --detach`. Only affects what
+    /// it tells the reader to do to stop it: there is no tty to ctrl-c.
+    detached: bool,
 }
 
-pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
+pub async fn up(config: ArigConfig, detached: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     let _job = platform::win::JobGuard::new()?;
 
@@ -112,6 +115,7 @@ pub async fn up(config: ArigConfig) -> anyhow::Result<()> {
         bus: bus.clone(),
         shutdown_rx,
         registry,
+        detached,
     };
     let result = kernel.run().await;
 
@@ -203,6 +207,7 @@ impl Kernel {
                     wave: wave_idx,
                     kind: ServiceKind::from(&service.service_type),
                     pid,
+                    probed: probes.contains_key(name.as_str()),
                 });
 
                 if service.service_type == ServiceType::Oneshot {
@@ -299,6 +304,11 @@ impl Kernel {
             }
         }
 
+        // Every wave is up and every probe has passed. Emitted before the
+        // console line so a waiter is released by the state change rather than
+        // by whatever a sink does with the line.
+        self.bus.emit(Event::StartupComplete);
+
         if children.is_empty() {
             event!(self.bus, "arig: all tasks completed.");
             return Ok(());
@@ -306,8 +316,15 @@ impl Kernel {
 
         event!(
             self.bus,
-            "arig: {} service(s) running. Press Ctrl+C to stop.",
-            children.len()
+            "arig: {} service(s) running. {}",
+            children.len(),
+            // Detached, ctrl-c reaches nothing: the supervisor called setsid
+            // and has no controlling terminal.
+            if self.detached {
+                "Run `arig down` to stop."
+            } else {
+                "Press Ctrl+C to stop."
+            }
         );
 
         let mut rx = self.shutdown_rx.clone();
@@ -478,6 +495,17 @@ async fn handle_client(
             let snap = state.snapshot();
             let _ = protocol::write_response(&mut wr, &protocol::Response::ps(snap)).await;
         }
+        protocol::Request::Wait => {
+            // No deadline here: the client owns the timeout, and a supervisor
+            // that gives up on startup exits, which the client sees as EOF.
+            let mut startup = state.startup();
+            while !*startup.borrow_and_update() {
+                if startup.changed().await.is_err() {
+                    return;
+                }
+            }
+            let _ = protocol::write_response(&mut wr, &protocol::Response::ok()).await;
+        }
         protocol::Request::Down => {
             // Flush response before triggering shutdown so the client always
             // sees the ack even if the supervisor exits quickly.
@@ -587,6 +615,9 @@ async fn wait_ready(bus: &Bus, name: &str, pending: &PendingProbe) -> anyhow::Re
         let last_err = match check.check().await {
             Ok(()) => {
                 event!(bus, "arig: '{name}' is ready");
+                bus.emit(Event::ServiceReady {
+                    name: name.to_string(),
+                });
                 return Ok(());
             }
             Err(e) => e,
@@ -824,6 +855,15 @@ mod tests {
         force_kill: bool,
         probe: Option<Arc<dyn Probe>>,
     ) -> (Vec<String>, Vec<Event>) {
+        run_to_shutdown_detached(services, force_kill, probe, false).await
+    }
+
+    async fn run_to_shutdown_detached(
+        services: &[(&str, &[&str])],
+        force_kill: bool,
+        probe: Option<Arc<dyn Probe>>,
+        detached: bool,
+    ) -> (Vec<String>, Vec<Event>) {
         let bus = Bus::new(64);
         let mut collected = bus.subscribe();
         let mut starts = bus.subscribe();
@@ -851,6 +891,7 @@ mod tests {
             bus: bus.clone(),
             shutdown_rx,
             registry,
+            detached,
         };
 
         let expected = services.len();
@@ -936,6 +977,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_passing_probe_reports_the_service_ready_on_the_bus() {
+        let (_, events) = run_to_shutdown(
+            &[("db", &[])],
+            false,
+            Some(Arc::new(FakeProbe { passes: true })),
+        )
+        .await;
+
+        // The log line above is for a reader; this is what `arig ps` and
+        // `arig wait` are derived from.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ServiceStarted { probed: true, .. })),
+            "got: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ServiceReady { name } if name == "db")),
+            "got: {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_is_reported_complete_once_every_wave_is_up() {
+        let (_, events) = run_to_shutdown(&[("db", &[]), ("api", &["db"])], false, None).await;
+
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, Event::ServiceStarted { .. }))
+            .count();
+        let complete = events
+            .iter()
+            .position(|e| matches!(e, Event::StartupComplete))
+            .expect("startup must be reported complete");
+        assert_eq!(started, 2);
+        // Nothing may claim the stack is up before the last wave has spawned.
+        let last_start = events
+            .iter()
+            .rposition(|e| matches!(e, Event::ServiceStarted { .. }))
+            .expect("services started");
+        assert!(complete > last_start, "got: {events:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_detached_supervisor_does_not_advise_ctrl_c() {
+        let (_, events) = run_to_shutdown_detached(&[("a", &[])], false, None, true).await;
+
+        let running = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Supervisor { line } if line.contains("service(s) running") => Some(line),
+                _ => None,
+            })
+            .next()
+            .expect("the running line must be emitted");
+        assert!(running.contains("arig down"), "got: {running}");
+        assert!(!running.contains("Ctrl+C"), "got: {running}");
+    }
+
+    #[tokio::test]
     async fn a_probe_that_never_passes_fails_the_wave() {
         let bus = Bus::new(64);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -956,6 +1059,7 @@ mod tests {
             bus,
             shutdown_rx,
             registry,
+            detached: false,
         };
 
         let err = kernel

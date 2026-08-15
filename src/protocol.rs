@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 pub enum Request {
     /// List currently-tracked services.
     Ps,
+    /// Block until every wave is up and every readiness probe has passed.
+    /// The supervisor holds the connection open until then.
+    Wait,
     /// Trigger supervisor shutdown.
     Down,
 }
@@ -56,6 +59,28 @@ pub struct ServiceSnapshot {
     /// Absent for a runtime whose services are not host processes.
     pub pid: Option<u32>,
     pub status: String,
+    pub ready: Readiness,
+}
+
+/// Where a service is against its readiness probe. Separate from `status`,
+/// which reports the process: a service can be running and not yet ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Readiness {
+    /// No probe gates this service, so there is nothing to wait for.
+    Unchecked,
+    Pending,
+    Ready,
+}
+
+impl Readiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readiness::Unchecked => "-",
+            Readiness::Pending => "pending",
+            Readiness::Ready => "ready",
+        }
+    }
 }
 
 pub async fn read_request<R: AsyncRead + Unpin>(reader: R) -> Result<Request> {
@@ -86,6 +111,10 @@ where
 
     let mut br = BufReader::new(rd);
     let mut line = String::new();
-    br.read_line(&mut line).await.context("read response")?;
+    // A supervisor that exits mid-request closes the stream instead of
+    // answering, which reads as EOF rather than as a parse failure.
+    if br.read_line(&mut line).await.context("read response")? == 0 {
+        anyhow::bail!("supervisor closed the connection without answering");
+    }
     serde_json::from_str(line.trim()).context("parse response")
 }

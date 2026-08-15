@@ -31,6 +31,30 @@ pub async fn down(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Block until the supervisor reports every wave up and every probe passed.
+pub async fn wait(workspace: &Path, timeout: Duration) -> Result<()> {
+    let endpoint = ipc::Endpoint::for_workspace(workspace)?;
+    let stream = ipc::connect(&endpoint)
+        .await
+        .with_context(|| format!("no supervisor at {}", endpoint.address))?;
+
+    // The supervisor holds the connection until it is up, so the timeout is
+    // on the exchange rather than on a poll loop.
+    let resp = match tokio::time::timeout(timeout, protocol::exchange(stream, &Request::Wait)).await
+    {
+        Ok(resp) => resp.context("exchange wait")?,
+        Err(_) => anyhow::bail!(
+            "services were not ready within {}",
+            humantime::format_duration(timeout)
+        ),
+    };
+    if !resp.ok {
+        anyhow::bail!("wait: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+    }
+    println!("arig: ready");
+    Ok(())
+}
+
 pub async fn ps(workspace: &Path) -> Result<()> {
     let endpoint = ipc::Endpoint::for_workspace(workspace)?;
     let stream = ipc::connect(&endpoint)
@@ -69,7 +93,7 @@ fn print_ps(services: &[protocol::ServiceSnapshot]) {
         .max(6);
 
     println!(
-        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}",
+        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  READY",
         "NAME", "WAVE", "PID", "KIND", "STATUS",
     );
     for s in services {
@@ -78,8 +102,13 @@ fn print_ps(services: &[protocol::ServiceSnapshot]) {
             None => "-".to_string(),
         };
         println!(
-            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}",
-            s.name, s.wave, pid, s.kind, s.status,
+            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {}",
+            s.name,
+            s.wave,
+            pid,
+            s.kind,
+            s.status,
+            s.ready.as_str(),
         );
     }
 }

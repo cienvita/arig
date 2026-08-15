@@ -1,18 +1,37 @@
 use crate::event::{Bus, Event};
-use crate::protocol::ServiceSnapshot;
+use crate::protocol::{Readiness, ServiceSnapshot};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 
 /// What `arig ps` reports, derived from the event stream so the bus stays the
 /// only record of service state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StateTracker {
     services: Arc<Mutex<Vec<ServiceSnapshot>>>,
+    /// Flips once every wave is up. Behind a watch so `arig wait` can block on
+    /// it rather than poll the snapshot.
+    startup: Arc<watch::Sender<bool>>,
+}
+
+impl Default for StateTracker {
+    fn default() -> Self {
+        Self {
+            services: Arc::default(),
+            startup: Arc::new(watch::channel(false).0),
+        }
+    }
 }
 
 impl StateTracker {
     pub fn snapshot(&self) -> Vec<ServiceSnapshot> {
         self.services.lock().expect("state mutex poisoned").clone()
+    }
+
+    /// Watch for startup completing. Already-true when the caller arrives
+    /// after the fact, so a late `arig wait` returns immediately.
+    pub fn startup(&self) -> watch::Receiver<bool> {
+        self.startup.subscribe()
     }
 
     pub fn apply(&self, event: &Event) {
@@ -23,13 +42,30 @@ impl StateTracker {
                 wave,
                 kind,
                 pid,
+                probed,
             } => services.push(ServiceSnapshot {
                 name: name.clone(),
                 kind: kind.as_str().to_string(),
                 wave: *wave,
                 pid: *pid,
                 status: "running".to_string(),
+                ready: if *probed {
+                    Readiness::Pending
+                } else {
+                    Readiness::Unchecked
+                },
             }),
+            Event::ServiceReady { name } => {
+                if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
+                    service.ready = Readiness::Ready;
+                }
+            }
+            // send_replace, not send: with no `arig wait` connected yet there
+            // are no receivers, and send would leave the value unset for the
+            // waiter that arrives afterwards.
+            Event::StartupComplete => {
+                self.startup.send_replace(true);
+            }
             // A failed oneshot keeps its row: the supervisor is about to shut
             // everything down and the row is what `arig ps` shows meanwhile.
             Event::OneshotCompleted { name, success } if *success => {
@@ -77,6 +113,17 @@ mod tests {
             wave,
             kind,
             pid: Some(pid),
+            probed: false,
+        }
+    }
+
+    fn probed(name: &str) -> Event {
+        Event::ServiceStarted {
+            name: name.to_string(),
+            wave: 0,
+            kind: ServiceKind::Service,
+            pid: Some(33),
+            probed: true,
         }
     }
 
@@ -98,6 +145,41 @@ mod tests {
         assert_eq!(snapshot[0].wave, 1);
         assert_eq!(snapshot[0].pid, Some(22));
         assert_eq!(snapshot[0].status, "running");
+        assert_eq!(snapshot[0].ready, Readiness::Unchecked);
+    }
+
+    #[test]
+    fn a_probed_service_is_pending_until_its_probe_passes() {
+        let tracker = StateTracker::default();
+
+        tracker.apply(&probed("db"));
+        assert_eq!(tracker.snapshot()[0].ready, Readiness::Pending);
+
+        tracker.apply(&Event::ServiceReady {
+            name: "db".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].ready, Readiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn startup_stays_unfinished_until_the_kernel_says_so() {
+        let tracker = StateTracker::default();
+        let mut rx = tracker.startup();
+        assert!(!*rx.borrow_and_update());
+
+        tracker.apply(&probed("db"));
+        assert!(!*rx.borrow_and_update());
+
+        tracker.apply(&Event::StartupComplete);
+        assert!(*rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn a_late_waiter_sees_startup_already_complete() {
+        let tracker = StateTracker::default();
+        tracker.apply(&Event::StartupComplete);
+
+        assert!(*tracker.startup().borrow_and_update());
     }
 
     #[test]
