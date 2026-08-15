@@ -92,6 +92,14 @@ pub trait RunningService: Send {
 
     async fn wait(&mut self) -> anyhow::Result<Exit>;
 
+    /// Whether the service has already exited, without blocking on it. The
+    /// kernel spawns a wave and then goes on to wait out the next one's
+    /// probes, so a service that died in between is not noticed until it is
+    /// asked about. `None` means still running, or not answerable - a runtime
+    /// that cannot tell reports the service as running rather than inventing
+    /// an exit.
+    async fn try_exit(&mut self) -> Option<Exit>;
+
     /// Set the service on its way out without blocking. The kernel calls this
     /// for every service in a wave before it waits on any of them, so a wave
     /// stops concurrently rather than one service at a time.

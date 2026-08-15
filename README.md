@@ -40,7 +40,8 @@ Reads `arig.yaml` in the current directory. Example:
 supervisor is accepting commands, which is before any service has started.
 
 `arig wait` blocks until every wave is up and every readiness probe has
-passed, then exits 0. It exits non-zero if the supervisor gives up on a probe
+passed, then exits 0. It exits non-zero, reporting why, if a probe never
+passes, a oneshot fails, a service exits while the stack is still coming up,
 or the timeout (`--timeout`, default 2m) elapses first.
 
 `arig ps` lists what the supervisor is tracking. `STATUS` reports the process,

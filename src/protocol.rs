@@ -59,15 +59,21 @@ pub struct ServiceSnapshot {
     /// Absent for a runtime whose services are not host processes.
     pub pid: Option<u32>,
     pub status: String,
+    /// Defaulted rather than required: a detached supervisor outlives an
+    /// upgrade, so a newer `arig ps` has to read a response from an older
+    /// supervisor that has no readiness to report.
+    #[serde(default)]
     pub ready: Readiness,
 }
 
 /// Where a service is against its readiness probe. Separate from `status`,
 /// which reports the process: a service can be running and not yet ready.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Readiness {
-    /// No probe gates this service, so there is nothing to wait for.
+    /// No probe gates this service, so there is nothing to wait for. Also
+    /// what a supervisor too old to report readiness degrades to.
+    #[default]
     Unchecked,
     Pending,
     Ready,
@@ -96,6 +102,30 @@ pub async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, resp: &Respon
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A detached supervisor outlives an upgrade of the binary, so a newer
+    /// `arig ps` has to read a response written by an older supervisor.
+    #[test]
+    fn a_response_from_before_readiness_still_parses() {
+        let older = r#"{"ok":true,"services":[
+            {"name":"api","kind":"service","wave":0,"pid":22,"status":"running"}
+        ]}"#;
+
+        let resp: Response = serde_json::from_str(older).expect("an older response must parse");
+        let services = resp.services.expect("the response carries services");
+        assert_eq!(services[0].ready, Readiness::Unchecked);
+    }
+
+    #[test]
+    fn readiness_goes_over_the_wire_lowercased() {
+        let json = serde_json::to_string(&Readiness::Pending).expect("serialize");
+        assert_eq!(json, r#""pending""#);
+    }
 }
 
 /// Client helper: send a request on the stream and read back the response.

@@ -63,9 +63,6 @@ pub enum Event {
     ServiceReady {
         name: String,
     },
-    /// Every wave is up: each oneshot ran and each probe passed. The last
-    /// thing the startup path reports before it starts waiting on services.
-    StartupComplete,
     OneshotCompleted {
         name: String,
         success: bool,

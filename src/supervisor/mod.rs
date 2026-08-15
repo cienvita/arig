@@ -10,7 +10,7 @@ use crate::protocol;
 use crate::registry::{BoundProbe, Registry};
 use crate::runtime::{Exit, RunningService, StopOutcome};
 use crate::sink;
-use crate::state::{self, StateTracker};
+use crate::state::{self, Startup, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
 use logs::{LastOutput, LogTail};
@@ -60,6 +60,8 @@ struct Kernel {
     bus: Bus,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     registry: Registry,
+    /// Where the startup verdict is recorded for `arig wait` to read.
+    state: StateTracker,
     /// Whether this supervisor was spawned by `up --detach`. Only affects what
     /// it tells the reader to do to stop it: there is no tty to ctrl-c.
     detached: bool,
@@ -104,7 +106,7 @@ pub async fn up(config: ArigConfig, detached: bool) -> anyhow::Result<()> {
     let acceptor = ipc::Acceptor::new(listener, endpoint.address.clone());
     let _ipc_task = tokio::spawn(ipc_accept_loop(
         acceptor,
-        state,
+        state.clone(),
         shutdown_tx.clone(),
         bus.clone(),
     ));
@@ -115,9 +117,18 @@ pub async fn up(config: ArigConfig, detached: bool) -> anyhow::Result<()> {
         bus: bus.clone(),
         shutdown_rx,
         registry,
+        state: state.clone(),
         detached,
     };
     let result = kernel.run().await;
+
+    // Whatever happened, anything blocked in `arig wait` needs an answer
+    // rather than the closed connection it would get when we exit. A startup
+    // that already settled keeps its verdict.
+    state.finish_startup(match &result {
+        Ok(()) => Startup::Failed("supervisor stopped before startup finished".to_string()),
+        Err(err) => Startup::Failed(err.to_string()),
+    });
 
     // The sinks run in a task of their own, so give them a moment to write the
     // lines emitted just before we return.
@@ -166,6 +177,36 @@ impl Kernel {
                 .with_context(|| format!("service '{name}'"))?;
         }
         Ok(())
+    }
+
+    /// Fail startup now, so anything blocked in `arig wait` hears the reason
+    /// before the shutdown that follows rather than after it.
+    fn fail_startup(&self, reason: impl Into<String>) {
+        self.state.finish_startup(Startup::Failed(reason.into()));
+    }
+
+    /// Report every service already gone, and answer with the first of them.
+    /// A long-running service is not waited on until every wave is up, so one
+    /// that died while a later wave was still coming up has gone unnoticed;
+    /// without this the stack is called ready and torn down a moment later.
+    async fn exited_during_startup(&self, children: &mut [ManagedChild]) -> Option<usize> {
+        let mut first = None;
+        for (idx, managed) in children.iter_mut().enumerate() {
+            let Some(exit) = managed.handle.try_exit().await else {
+                continue;
+            };
+            event!(
+                self.bus,
+                "arig: service '{}' exited during startup ({exit})",
+                managed.name
+            );
+            self.bus.emit(Event::ServiceExited {
+                name: managed.name.clone(),
+                status: exit.to_string(),
+            });
+            first.get_or_insert(idx);
+        }
+        first
     }
 
     async fn run(&self) -> anyhow::Result<()> {
@@ -259,6 +300,7 @@ impl Kernel {
                             name: managed.name.clone(),
                             success: false,
                         });
+                        self.fail_startup(format!("oneshot '{}' failed", managed.name));
                         drain_io(&mut managed.io_tasks).await;
                         dump_tail(&self.bus, &managed.name, &managed.tail);
                         shutdown(&self.bus, &mut children, None).await;
@@ -266,6 +308,7 @@ impl Kernel {
                     }
                     Err(err) => {
                         event!(self.bus, "arig: {err}");
+                        self.fail_startup(err.to_string());
                         self.bus.emit(Event::OneshotCompleted {
                             name: managed.name.clone(),
                             success: false,
@@ -293,6 +336,7 @@ impl Kernel {
 
                 if let Err(err) = result {
                     event!(self.bus, "arig: {err}");
+                    self.fail_startup(err.to_string());
                     if let Some(idx) = children.iter().position(|c| c.name == name) {
                         drain_io(&mut children[idx].io_tasks).await;
                         let n = children[idx].name.clone();
@@ -304,10 +348,20 @@ impl Kernel {
             }
         }
 
-        // Every wave is up and every probe has passed. Emitted before the
-        // console line so a waiter is released by the state change rather than
-        // by whatever a sink does with the line.
-        self.bus.emit(Event::StartupComplete);
+        // Every wave is up and every probe has passed, but a probe that took
+        // a while is time a service in an earlier wave had to die in. Ask
+        // before calling the stack ready.
+        if let Some(idx) = self.exited_during_startup(&mut children).await {
+            let name = children[idx].name.clone();
+            self.fail_startup(format!("service '{name}' exited during startup"));
+            drain_io(&mut children[idx].io_tasks).await;
+            dump_tail(&self.bus, &name, &children[idx].tail);
+            shutdown(&self.bus, &mut children, Some(idx)).await;
+            event!(self.bus, "arig: all services stopped.");
+            anyhow::bail!("service '{name}' exited during startup");
+        }
+
+        self.state.finish_startup(Startup::Ready);
 
         if children.is_empty() {
             event!(self.bus, "arig: all tasks completed.");
@@ -496,15 +550,15 @@ async fn handle_client(
             let _ = protocol::write_response(&mut wr, &protocol::Response::ps(snap)).await;
         }
         protocol::Request::Wait => {
-            // No deadline here: the client owns the timeout, and a supervisor
-            // that gives up on startup exits, which the client sees as EOF.
-            let mut startup = state.startup();
-            while !*startup.borrow_and_update() {
-                if startup.changed().await.is_err() {
-                    return;
-                }
-            }
-            let _ = protocol::write_response(&mut wr, &protocol::Response::ok()).await;
+            // No deadline here: the client owns the timeout. A startup that
+            // fails answers with the reason rather than leaving the client to
+            // infer one from a closed connection.
+            let resp = match state.wait_startup().await {
+                Startup::Ready => protocol::Response::ok(),
+                Startup::Failed(reason) => protocol::Response::err(reason),
+                Startup::Pending => protocol::Response::err("startup state unknown"),
+            };
+            let _ = protocol::write_response(&mut wr, &resp).await;
         }
         protocol::Request::Down => {
             // Flush response before triggering shutdown so the client always
@@ -721,6 +775,9 @@ mod tests {
     struct FakeRuntime {
         log: StopLog,
         force_kill: bool,
+        /// Name of a service that is to report itself already gone the first
+        /// time the kernel asks.
+        dies_during_startup: Option<String>,
     }
 
     #[async_trait]
@@ -737,6 +794,8 @@ mod tests {
                     name: name.to_string(),
                     log: self.log.clone(),
                     force_kill: self.force_kill,
+                    already_exited: (self.dies_during_startup.as_deref() == Some(name))
+                        .then(|| Exit::from_code(3)),
                 }),
                 stdout: None,
                 stderr: None,
@@ -748,6 +807,9 @@ mod tests {
         name: String,
         log: StopLog,
         force_kill: bool,
+        /// What `try_exit` answers, standing in for a service that died while
+        /// a later wave was still coming up.
+        already_exited: Option<Exit>,
     }
 
     #[async_trait]
@@ -759,6 +821,10 @@ mod tests {
         async fn wait(&mut self) -> anyhow::Result<Exit> {
             // Long-running: nothing but shutdown ends this.
             std::future::pending().await
+        }
+
+        async fn try_exit(&mut self) -> Option<Exit> {
+            self.already_exited.clone()
         }
 
         fn begin_stop(&mut self) {
@@ -847,36 +913,59 @@ mod tests {
         }
     }
 
-    /// Run the kernel over `services`, ask it to shut down once they are all
-    /// up, and report what the runtime saw and what reached the bus. With a
-    /// `probe`, every service gets a readiness block for it to answer.
-    async fn run_to_shutdown(
-        services: &[(&str, &[&str])],
-        force_kill: bool,
-        probe: Option<Arc<dyn Probe>>,
-    ) -> (Vec<String>, Vec<Event>) {
-        run_to_shutdown_detached(services, force_kill, probe, false).await
-    }
-
-    async fn run_to_shutdown_detached(
-        services: &[(&str, &[&str])],
+    /// How a run is set up. The defaults are the ordinary case: services that
+    /// stay up, no probes, attached to a terminal.
+    #[derive(Default)]
+    struct Setup {
         force_kill: bool,
         probe: Option<Arc<dyn Probe>>,
         detached: bool,
-    ) -> (Vec<String>, Vec<Event>) {
+        /// Service that reports itself already gone the first time the kernel
+        /// asks, as one that died while a later wave was still coming up.
+        dies_during_startup: Option<String>,
+    }
+
+    /// What a run left behind.
+    struct Ran {
+        stops: Vec<String>,
+        events: Vec<Event>,
+        startup: Startup,
+    }
+
+    impl Ran {
+        /// The `arig: ...` lines, in the order they were emitted.
+        fn lines(&self) -> Vec<&str> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Supervisor { line } => Some(line.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Run the kernel over `services`, ask it to shut down once they are all
+    /// up, and report what the runtime saw, what reached the bus, and how
+    /// startup ended. With a probe, every service gets a readiness block for
+    /// it to answer.
+    async fn run_to_shutdown(services: &[(&str, &[&str])], setup: Setup) -> Ran {
         let bus = Bus::new(64);
         let mut collected = bus.subscribe();
         let mut starts = bus.subscribe();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let log = StopLog::default();
+        let state = StateTracker::default();
+        let detached = setup.detached;
 
         let mut registry = Registry::default();
         registry.register(Arc::new(FakeRuntime {
             log: log.clone(),
-            force_kill,
+            force_kill: setup.force_kill,
+            dies_during_startup: setup.dies_during_startup,
         }));
-        let ready = probe.is_some();
-        if let Some(probe) = probe {
+        let ready = setup.probe.is_some();
+        if let Some(probe) = setup.probe {
             registry.register_probe(probe);
         }
 
@@ -891,6 +980,7 @@ mod tests {
             bus: bus.clone(),
             shutdown_rx,
             registry,
+            state: state.clone(),
             detached,
         };
 
@@ -907,29 +997,43 @@ mod tests {
             let _ = shutdown_tx.send(true);
         });
 
-        kernel.run().await.expect("kernel run");
+        // Not asserted on: a run that fails is a case under test, and the
+        // verdict below says so more precisely than the error does.
+        let result = kernel.run().await;
+        state.finish_startup(match &result {
+            Ok(()) => Startup::Failed("supervisor stopped before startup finished".to_string()),
+            Err(err) => Startup::Failed(err.to_string()),
+        });
         trigger.await.expect("trigger task");
 
         let mut events = Vec::new();
         while let Ok(event) = collected.try_recv() {
             events.push(event);
         }
-        (log.entries(), events)
+        Ran {
+            stops: log.entries(),
+            events,
+            startup: state.wait_startup().await,
+        }
     }
 
     #[tokio::test]
     async fn services_stop_in_reverse_wave_order() {
-        let (stops, _) = run_to_shutdown(&[("db", &[]), ("api", &["db"])], false, None).await;
+        let ran = run_to_shutdown(&[("db", &[]), ("api", &["db"])], Setup::default()).await;
 
-        assert_eq!(stops, ["begin api", "finish api", "begin db", "finish db"]);
+        assert_eq!(
+            ran.stops,
+            ["begin api", "finish api", "begin db", "finish db"]
+        );
     }
 
     #[tokio::test]
     async fn a_whole_wave_is_signalled_before_any_of_it_is_waited_on() {
-        let (stops, _) = run_to_shutdown(&[("a", &[]), ("b", &[])], false, None).await;
+        let ran = run_to_shutdown(&[("a", &[]), ("b", &[])], Setup::default()).await;
 
         // Which of the two goes first follows config iteration order, so the
         // claim is about the split between signalling and waiting.
+        let stops = ran.stops;
         assert_eq!(stops.len(), 4, "got: {stops:?}");
         assert!(
             stops[..2].iter().all(|s| s.starts_with("begin")),
@@ -943,9 +1047,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_service_the_runtime_had_to_kill_is_reported_as_killed() {
-        let (_, events) = run_to_shutdown(&[("a", &[])], true, None).await;
+        let ran = run_to_shutdown(
+            &[("a", &[])],
+            Setup {
+                force_kill: true,
+                ..Setup::default()
+            },
+        )
+        .await;
 
-        let exits: Vec<_> = events
+        let exits: Vec<_> = ran
+            .events
             .iter()
             .filter_map(|e| match e {
                 Event::ServiceExited { name, status } => Some((name.as_str(), status.as_str())),
@@ -957,36 +1069,35 @@ mod tests {
 
     #[tokio::test]
     async fn a_wave_waits_on_the_probe_the_registry_resolved() {
-        let (_, events) = run_to_shutdown(
+        let ran = run_to_shutdown(
             &[("db", &[]), ("api", &["db"])],
-            false,
-            Some(Arc::new(FakeProbe { passes: true })),
+            Setup {
+                probe: Some(Arc::new(FakeProbe { passes: true })),
+                ..Setup::default()
+            },
         )
         .await;
 
         // 'api' is in the second wave, so it only started because the probe
         // for 'db' was consulted and passed first.
-        let lines: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Supervisor { line } => Some(line.as_str()),
-                _ => None,
-            })
-            .collect();
+        let lines = ran.lines();
         assert!(lines.contains(&"arig: 'db' is ready"), "got: {lines:#?}");
     }
 
     #[tokio::test]
     async fn a_passing_probe_reports_the_service_ready_on_the_bus() {
-        let (_, events) = run_to_shutdown(
+        let ran = run_to_shutdown(
             &[("db", &[])],
-            false,
-            Some(Arc::new(FakeProbe { passes: true })),
+            Setup {
+                probe: Some(Arc::new(FakeProbe { passes: true })),
+                ..Setup::default()
+            },
         )
         .await;
 
         // The log line above is for a reader; this is what `arig ps` and
         // `arig wait` are derived from.
+        let events = &ran.events;
         assert!(
             events
                 .iter()
@@ -1002,37 +1113,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_is_reported_complete_once_every_wave_is_up() {
-        let (_, events) = run_to_shutdown(&[("db", &[]), ("api", &["db"])], false, None).await;
+    async fn startup_is_ready_once_every_wave_is_up() {
+        let ran = run_to_shutdown(&[("db", &[]), ("api", &["db"])], Setup::default()).await;
 
-        let started = events
+        let started = ran
+            .events
             .iter()
             .filter(|e| matches!(e, Event::ServiceStarted { .. }))
             .count();
-        let complete = events
-            .iter()
-            .position(|e| matches!(e, Event::StartupComplete))
-            .expect("startup must be reported complete");
         assert_eq!(started, 2);
-        // Nothing may claim the stack is up before the last wave has spawned.
-        let last_start = events
-            .iter()
-            .rposition(|e| matches!(e, Event::ServiceStarted { .. }))
-            .expect("services started");
-        assert!(complete > last_start, "got: {events:#?}");
+        assert_eq!(ran.startup, Startup::Ready);
+    }
+
+    /// The gap this closes: a service in an earlier wave dies while a later
+    /// wave is still coming up, and nothing waits on it until every wave is
+    /// done, so the stack would be called ready and torn down a moment later.
+    #[tokio::test]
+    async fn a_service_that_died_during_startup_fails_the_startup() {
+        let ran = run_to_shutdown(
+            &[("crasher", &[]), ("api", &["crasher"])],
+            Setup {
+                dies_during_startup: Some("crasher".to_string()),
+                ..Setup::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            ran.startup,
+            Startup::Failed("service 'crasher' exited during startup".to_string()),
+        );
+        // And `ps` is told, so the row stops claiming it is running.
+        assert!(
+            ran.events
+                .iter()
+                .any(|e| matches!(e, Event::ServiceExited { name, .. } if name == "crasher")),
+            "got: {:#?}",
+            ran.events
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_passes_fails_the_startup_with_its_reason() {
+        let ran = run_to_shutdown(
+            &[("api", &[])],
+            Setup {
+                probe: Some(Arc::new(FakeProbe { passes: false })),
+                ..Setup::default()
+            },
+        )
+        .await;
+
+        // The reason reaches `arig wait`, which has no other way to learn it.
+        let Startup::Failed(reason) = &ran.startup else {
+            panic!(
+                "a probe that never passes must fail startup, got: {:?}",
+                ran.startup
+            );
+        };
+        assert!(reason.contains("nothing there"), "got: {reason}");
     }
 
     #[tokio::test]
     async fn a_detached_supervisor_does_not_advise_ctrl_c() {
-        let (_, events) = run_to_shutdown_detached(&[("a", &[])], false, None, true).await;
+        let ran = run_to_shutdown(
+            &[("a", &[])],
+            Setup {
+                detached: true,
+                ..Setup::default()
+            },
+        )
+        .await;
 
-        let running = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Supervisor { line } if line.contains("service(s) running") => Some(line),
-                _ => None,
-            })
-            .next()
+        let running = ran
+            .lines()
+            .into_iter()
+            .find(|line| line.contains("service(s) running"))
             .expect("the running line must be emitted");
         assert!(running.contains("arig down"), "got: {running}");
         assert!(!running.contains("Ctrl+C"), "got: {running}");
@@ -1048,6 +1204,7 @@ mod tests {
         registry.register(Arc::new(FakeRuntime {
             log: log.clone(),
             force_kill: false,
+            dies_during_startup: None,
         }));
         registry.register_probe(Arc::new(FakeProbe { passes: false }));
 
@@ -1059,6 +1216,7 @@ mod tests {
             bus,
             shutdown_rx,
             registry,
+            state: StateTracker::default(),
             detached: false,
         };
 

@@ -40,19 +40,33 @@ pub async fn wait(workspace: &Path, timeout: Duration) -> Result<()> {
 
     // The supervisor holds the connection until it is up, so the timeout is
     // on the exchange rather than on a poll loop.
+    let log = supervisor_log(workspace);
     let resp = match tokio::time::timeout(timeout, protocol::exchange(stream, &Request::Wait)).await
     {
-        Ok(resp) => resp.context("exchange wait")?,
+        // A supervisor that dies outright answers nothing, so the reason for
+        // it is only in its log.
+        Ok(resp) => resp.with_context(|| format!("check {} for details", log.display()))?,
         Err(_) => anyhow::bail!(
             "services were not ready within {}",
             humantime::format_duration(timeout)
         ),
     };
     if !resp.ok {
-        anyhow::bail!("wait: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+        anyhow::bail!(
+            "wait: {}. check {} for details",
+            resp.error.unwrap_or_else(|| "unknown".into()),
+            log.display(),
+        );
     }
     println!("arig: ready");
     Ok(())
+}
+
+/// Where a detached supervisor's own output goes. Fixed rather than read from
+/// the config, since it holds whatever a supervisor printed before its
+/// configured logging was up.
+fn supervisor_log(workspace: &Path) -> std::path::PathBuf {
+    workspace.join(".arig/var/supervisor.log")
 }
 
 pub async fn ps(workspace: &Path) -> Result<()> {

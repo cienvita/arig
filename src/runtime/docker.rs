@@ -309,6 +309,27 @@ impl RunningService for DockerService {
         self.wait_exit().await
     }
 
+    async fn try_exit(&mut self) -> Option<Exit> {
+        let inspect = match self.docker.inspect_container(&self.container, None).await {
+            Ok(inspect) => inspect,
+            Err(e) => {
+                event!(
+                    self.bus,
+                    "arig: cannot inspect the container for '{}' ({e})",
+                    self.name
+                );
+                return None;
+            }
+        };
+        // Only an explicit `running: false` counts. A daemon that reported
+        // neither is not evidence the container is gone.
+        let state = inspect.state?;
+        if state.running != Some(false) {
+            return None;
+        }
+        Some(Exit::from_code(state.exit_code.unwrap_or_default()))
+    }
+
     fn begin_stop(&mut self) {
         // The kernel wants the whole wave on its way out before it waits on any
         // one of it, and stopping a container is a call to the daemon, so this
