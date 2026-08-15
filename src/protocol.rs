@@ -61,10 +61,27 @@ pub struct ServiceSnapshot {
     pub status: String,
     /// Defaulted rather than required: a detached supervisor outlives an
     /// upgrade, so a newer `arig ps` has to read a response from an older
-    /// supervisor that has no readiness to report.
+    /// supervisor that has no readiness to report. Everything below is
+    /// defaulted for the same reason.
     #[serde(default)]
     pub ready: Readiness,
+    /// How many times this service has been started again since the stack
+    /// came up.
+    #[serde(default)]
+    pub restarts: u64,
+    /// How long the current instance has been running. Absent for a service
+    /// that is not running, and from a supervisor too old to report it.
+    #[serde(default)]
+    pub uptime_secs: Option<u64>,
+    /// The service's direct dependencies, so `ps` can mark a row whose
+    /// dependency is no longer running.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
+
+/// The `status` a service in ordinary operation reports. Both ends need it:
+/// the supervisor writes it, and `ps` marks dependencies that are not it.
+pub const RUNNING: &str = "running";
 
 /// Where a service is against its readiness probe. Separate from `status`,
 /// which reports the process: a service can be running and not yet ready.
@@ -119,6 +136,9 @@ mod tests {
         let resp: Response = serde_json::from_str(older).expect("an older response must parse");
         let services = resp.services.expect("the response carries services");
         assert_eq!(services[0].ready, Readiness::Unchecked);
+        assert_eq!(services[0].restarts, 0);
+        assert_eq!(services[0].uptime_secs, None);
+        assert!(services[0].depends_on.is_empty());
     }
 
     #[test]

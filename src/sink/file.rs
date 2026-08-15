@@ -185,6 +185,7 @@ mod tests {
             kind: ServiceKind::Service,
             pid: Some(1),
             probed: false,
+            depends_on: Vec::new(),
         });
         bus.drain(&cursor, Duration::from_secs(5)).await;
 

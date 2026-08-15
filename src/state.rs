@@ -1,6 +1,7 @@
 use crate::event::{Bus, Event};
-use crate::protocol::{Readiness, ServiceSnapshot};
+use crate::protocol::{self, Readiness, ServiceSnapshot};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
@@ -15,11 +16,26 @@ pub enum Startup {
     Failed(String),
 }
 
+/// One tracked service. `arig ps` renders this, but the row holds a little
+/// more than the wire carries: uptime is an instant here and seconds there.
+struct Row {
+    name: String,
+    kind: String,
+    wave: usize,
+    pid: Option<u32>,
+    status: String,
+    ready: Readiness,
+    restarts: u64,
+    /// When the current instance started, and `None` once it is gone.
+    started_at: Option<Instant>,
+    depends_on: Vec<String>,
+}
+
 /// What `arig ps` reports, derived from the event stream so the bus stays the
 /// only record of service state.
 #[derive(Clone)]
 pub struct StateTracker {
-    services: Arc<Mutex<Vec<ServiceSnapshot>>>,
+    services: Arc<Mutex<Vec<Row>>>,
     /// Settles once the kernel knows how startup ended. Set by the kernel
     /// rather than derived from the bus: a waiter must not be answered before
     /// the exits that decide the verdict have been applied, and events reach
@@ -38,7 +54,22 @@ impl Default for StateTracker {
 
 impl StateTracker {
     pub fn snapshot(&self) -> Vec<ServiceSnapshot> {
-        self.services.lock().expect("state mutex poisoned").clone()
+        self.services
+            .lock()
+            .expect("state mutex poisoned")
+            .iter()
+            .map(|row| ServiceSnapshot {
+                name: row.name.clone(),
+                kind: row.kind.clone(),
+                wave: row.wave,
+                pid: row.pid,
+                status: row.status.clone(),
+                ready: row.ready,
+                restarts: row.restarts,
+                uptime_secs: row.started_at.map(|t| t.elapsed().as_secs()),
+                depends_on: row.depends_on.clone(),
+            })
+            .collect()
     }
 
     /// Record how startup ended. The first verdict wins: a service that dies
@@ -80,18 +111,39 @@ impl StateTracker {
                 kind,
                 pid,
                 probed,
-            } => services.push(ServiceSnapshot {
-                name: name.clone(),
-                kind: kind.as_str().to_string(),
-                wave: *wave,
-                pid: *pid,
-                status: "running".to_string(),
-                ready: if *probed {
+                depends_on,
+            } => {
+                let ready = if *probed {
                     Readiness::Pending
                 } else {
                     Readiness::Unchecked
-                },
-            }),
+                };
+                // Upsert: a service that was stopped and started again keeps
+                // its row, or `ps` would list it twice.
+                match services.iter_mut().find(|s| &s.name == name) {
+                    Some(row) => {
+                        row.restarts += 1;
+                        row.kind = kind.as_str().to_string();
+                        row.wave = *wave;
+                        row.pid = *pid;
+                        row.status = protocol::RUNNING.to_string();
+                        row.ready = ready;
+                        row.started_at = Some(Instant::now());
+                        row.depends_on = depends_on.clone();
+                    }
+                    None => services.push(Row {
+                        name: name.clone(),
+                        kind: kind.as_str().to_string(),
+                        wave: *wave,
+                        pid: *pid,
+                        status: protocol::RUNNING.to_string(),
+                        ready,
+                        restarts: 0,
+                        started_at: Some(Instant::now()),
+                        depends_on: depends_on.clone(),
+                    }),
+                }
+            }
             Event::ServiceReady { name } => {
                 if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
                     service.ready = Readiness::Ready;
@@ -105,6 +157,7 @@ impl StateTracker {
             Event::ServiceExited { name, status } => {
                 if let Some(service) = services.iter_mut().find(|s| &s.name == name) {
                     service.status = status.clone();
+                    service.started_at = None;
                 }
             }
             _ => {}
@@ -145,6 +198,7 @@ mod tests {
             kind,
             pid: Some(pid),
             probed: false,
+            depends_on: Vec::new(),
         }
     }
 
@@ -155,6 +209,7 @@ mod tests {
             kind: ServiceKind::Service,
             pid: Some(33),
             probed: true,
+            depends_on: Vec::new(),
         }
     }
 
@@ -254,6 +309,40 @@ mod tests {
         });
 
         assert_eq!(tracker.snapshot().len(), 1);
+    }
+
+    /// A restarted service is the same service. A second row would show up in
+    /// `ps` as a second service that never goes away.
+    #[test]
+    fn starting_a_service_again_reuses_its_row() {
+        let tracker = StateTracker::default();
+
+        tracker.apply(&started("api", 0, ServiceKind::Service, 22));
+        tracker.apply(&Event::ServiceExited {
+            name: "api".to_string(),
+            status: "stopped".to_string(),
+        });
+        tracker.apply(&started("api", 0, ServiceKind::Service, 23));
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].pid, Some(23));
+        assert_eq!(snapshot[0].status, "running");
+        assert_eq!(snapshot[0].restarts, 1);
+    }
+
+    #[test]
+    fn a_running_service_reports_an_uptime_and_a_stopped_one_does_not() {
+        let tracker = StateTracker::default();
+
+        tracker.apply(&started("api", 0, ServiceKind::Service, 22));
+        assert!(tracker.snapshot()[0].uptime_secs.is_some());
+
+        tracker.apply(&Event::ServiceExited {
+            name: "api".to_string(),
+            status: "exit code 0".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].uptime_secs, None);
     }
 
     #[test]

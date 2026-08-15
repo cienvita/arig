@@ -58,6 +58,9 @@ pub enum Event {
         /// Whether a readiness probe gates this service. Started is not ready
         /// when one does, and subscribers have no other way to tell.
         probed: bool,
+        /// The service's direct dependencies. Carried here so the tracker can
+        /// relate rows to each other without reaching for the config.
+        depends_on: Vec<String>,
     },
     /// A service's readiness probe passed.
     ServiceReady {

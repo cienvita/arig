@@ -249,6 +249,7 @@ impl Kernel {
                     kind: ServiceKind::from(&service.service_type),
                     pid,
                     probed: probes.contains_key(name.as_str()),
+                    depends_on: service.depends_on.clone(),
                 });
 
                 if service.service_type == ServiceType::Oneshot {
