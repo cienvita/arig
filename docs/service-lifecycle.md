@@ -131,6 +131,25 @@ binary".
 sinks reattach across restarts; a generation id on the service instance
 distinguishes output from consecutive runs.
 
+## Pluggability
+
+Lifecycle rides the microkernel seams rather than becoming a plugin type of
+its own. The kernel keeps ownership of the state machine, the verbs, and
+ordering; what is pluggable is the execution of each phase and the
+observation of transitions:
+
+* Phase execution belongs to the Runtime extension trait. Spawn and stop
+  already do (`Runtime::spawn`, `RunningService::begin_stop`/`finish_stop`);
+  build joins them as a Runtime method whose default runs `build:` on the
+  host shell, so a runtime can later substitute a native build (a docker
+  image build) without kernel changes.
+* Transitions are bus events, and the bus is the observation surface. Log
+  sinks consume it today; `arig mcp` and external plugins subscribe to the
+  same stream. Plugins observe state and request transitions; they never own
+  states or add their own.
+* Named but not built: pre/post phase hooks as an extension trait, and
+  plugin-defined verbs once the external plugin protocol exists.
+
 ## Out of scope, enabled later
 
 * watch mode (file changes trigger build+restart): pure composition once
