@@ -162,6 +162,10 @@ struct Kernel {
     config_path: Option<std::path::PathBuf>,
     bus: Bus,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// The other end of that watch. The kernel sets it itself when a service
+    /// exits unexpectedly: the stack is going down either way, and anything
+    /// waiting on the watch has to hear about this teardown too.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     registry: Registry,
     /// Where the startup verdict is recorded for `arig wait` to read.
     state: StateTracker,
@@ -233,6 +237,7 @@ pub async fn up(
         config_path,
         bus: bus.clone(),
         shutdown_rx,
+        shutdown_tx: shutdown_tx.clone(),
         registry,
         state: state.clone(),
         detached,
@@ -583,6 +588,10 @@ impl Kernel {
                 }
                 Action::Exited(idx, status) => {
                     self.report_unexpected_exit(steady, idx, status).await;
+                    // The teardown below is a shutdown by another name, and
+                    // work that gives up on the watch, a build in particular,
+                    // would otherwise be waited out in full first.
+                    let _ = self.shutdown_tx.send(true);
                     self.settle_commands(steady).await;
                     shutdown(&self.bus, &mut steady.children, Some(idx)).await;
                     event!(self.bus, "arig: all services stopped.");
@@ -1528,6 +1537,11 @@ mod tests {
         /// Once set, every spawn fails, standing in for a command that cannot
         /// be run or an image that will not pull.
         spawn_fails: Option<Arc<AtomicBool>>,
+        /// Holds every oneshot, builds included, until a test releases it.
+        build_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Holds the crasher's exit until a test releases it, so a crash can
+        /// be timed against something else in flight.
+        crash_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait]
@@ -1549,9 +1563,16 @@ mod tests {
             // A oneshot has to end for the wave to move on, and a crasher has
             // to end for the steady loop to notice it. Builds arrive here as
             // oneshots too, which is what oneshot_exit is for.
-            let exits = (spec.service_type == ServiceType::Oneshot)
+            let oneshot = spec.service_type == ServiceType::Oneshot;
+            let crasher = self.crashes.as_deref() == Some(name);
+            let exits = oneshot
                 .then(|| Exit::from_code(self.oneshot_exit))
-                .or_else(|| (self.crashes.as_deref() == Some(name)).then(|| Exit::from_code(1)));
+                .or_else(|| crasher.then(|| Exit::from_code(1)));
+            let gate = match (oneshot, crasher) {
+                (true, _) => self.build_gate.clone(),
+                (_, true) => self.crash_gate.clone(),
+                _ => None,
+            };
             Ok(SpawnedService {
                 handle: Box::new(FakeService {
                     name: name.to_string(),
@@ -1560,6 +1581,7 @@ mod tests {
                     already_exited: (self.dies_during_startup.as_deref() == Some(name))
                         .then(|| Exit::from_code(3)),
                     exits,
+                    gate,
                     hold: self.hold.clone(),
                 }),
                 stdout: None,
@@ -1578,6 +1600,9 @@ mod tests {
         /// What `wait` answers. `None` is the long-running case: nothing but
         /// a stop ends it.
         exits: Option<Exit>,
+        /// Held before `wait` answers at all, for a test that needs the answer
+        /// to land at a particular moment.
+        gate: Option<Arc<tokio::sync::Notify>>,
         hold: Option<Arc<tokio::sync::Notify>>,
     }
 
@@ -1589,7 +1614,12 @@ mod tests {
 
         async fn wait(&mut self) -> anyhow::Result<Exit> {
             match &self.exits {
-                Some(exit) => Ok(exit.clone()),
+                Some(exit) => {
+                    if let Some(gate) = &self.gate {
+                        gate.notified().await;
+                    }
+                    Ok(exit.clone())
+                }
                 None => std::future::pending().await,
             }
         }
@@ -1728,6 +1758,10 @@ mod tests {
         probe_timeout: Duration,
         /// Flipped on by a test to make every spawn from then on fail.
         spawn_fails: Option<Arc<AtomicBool>>,
+        /// Holds every build until the test releases it.
+        build_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Holds the crasher's exit until the test releases it.
+        crash_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     /// What a run left behind.
@@ -1794,6 +1828,8 @@ mod tests {
             hold: setup.hold,
             oneshot_exit: setup.oneshot_exit,
             spawn_fails: setup.spawn_fails,
+            build_gate: setup.build_gate,
+            crash_gate: setup.crash_gate,
         }));
         let ready = setup.probe.is_some();
         if let Some(probe) = setup.probe {
@@ -1828,6 +1864,7 @@ mod tests {
             config_path: setup.config_file,
             bus: bus.clone(),
             shutdown_rx,
+            shutdown_tx: shutdown_tx.clone(),
             registry,
             state: state.clone(),
             detached: setup.detached,
@@ -2754,6 +2791,61 @@ mod tests {
         .await;
 
         ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// The teardown after a crash waits out the work it cannot abandon, and a
+    /// build has no timeout of its own, so it has to be told the stack is
+    /// going down rather than waited out in full.
+    #[tokio::test]
+    async fn a_crash_does_not_wait_out_a_build() {
+        let path = temp_config(
+            "crash-during-build",
+            "services:\n  db:\n    command: db\n  api:\n    command: run\n    build: make\n",
+        );
+        let build_gate = Arc::new(tokio::sync::Notify::new());
+        let crash_gate = Arc::new(tokio::sync::Notify::new());
+        let crash = crash_gate.clone();
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                crashes: Some("db".to_string()),
+                // The build is parked until the kernel gives up on it, which
+                // is the point: nothing else ends it.
+                build_gate: Some(build_gate),
+                crash_gate: Some(crash_gate),
+                ..Setup::default()
+            },
+            async |stack| {
+                let building = stack.send(build_only("api"));
+                stack
+                    .until("a build under way", |s| {
+                        s.spawns().iter().any(|spawn| spawn == "api make")
+                    })
+                    .await;
+
+                crash.notify_one();
+                stack
+                    .until("the stack torn down", |s| !s.is_running())
+                    .await;
+
+                let stopped = building
+                    .await
+                    .expect("the kernel answers every command")
+                    .expect_err("a build cut short is not a success");
+                assert!(stopped.contains("shutting down"), "got: {stopped}");
+            },
+        )
+        .await;
+
+        let err = ran
+            .result
+            .expect_err("a service exiting on its own is a failure");
+        assert!(
+            err.to_string().contains("exited unexpectedly"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
     }
 
