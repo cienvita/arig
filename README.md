@@ -52,9 +52,11 @@ stage as a whole, so a build with no `timeout:` of its own cannot hold
 startup open indefinitely; a service's own `timeout:` still bounds its
 individual build.
 
-`arig up -d` runs the supervisor in the background. It returns once the
-supervisor is accepting commands, which is before any building or starting
-has happened.
+`arig up -d` runs the supervisor in the background. It returns once every
+build has finished, which is before any service has started: a broken build
+fails in the terminal that asked for the stack, with the build's own output
+in the supervisor log, rather than surfacing only to whoever runs
+`arig wait` later.
 
 `arig wait` blocks until every wave is up and every readiness probe has
 passed, then exits 0. It exits non-zero, reporting why, if a build fails, a

@@ -89,6 +89,12 @@ pub struct StateTracker {
     /// the exits that decide the verdict have been applied, and events reach
     /// the tracker on a task of their own.
     startup: Arc<watch::Sender<Startup>>,
+    /// Settles once the build stage is over, well before startup does: `up
+    /// --detach` returns on this, so a broken build is reported to the
+    /// terminal that asked for it while the services' own startup stays
+    /// backgrounded. Set by the kernel, like `startup`, and covered by it: a
+    /// startup verdict of either kind also settles a build-stage waiter.
+    built: Arc<watch::Sender<bool>>,
 }
 
 impl Default for StateTracker {
@@ -96,6 +102,7 @@ impl Default for StateTracker {
         Self {
             services: Arc::default(),
             startup: Arc::new(watch::channel(Startup::Pending).0),
+            built: Arc::new(watch::channel(false).0),
         }
     }
 }
@@ -139,6 +146,44 @@ impl StateTracker {
     /// so a command sent before that would hang rather than be refused.
     pub fn startup(&self) -> Startup {
         self.startup.borrow().clone()
+    }
+
+    /// Record that the build stage is over and the waves are next.
+    pub fn finish_builds(&self) {
+        self.built.send_replace(true);
+    }
+
+    /// Block until the build stage is over, answering with the startup
+    /// failure if that verdict lands first: a broken build fails startup
+    /// without ever finishing the stage, and so does anything before it.
+    /// Returns immediately for a caller that arrives after the fact.
+    pub async fn wait_built(&self) -> Result<(), String> {
+        let mut built = self.built.subscribe();
+        let mut startup = self.startup.subscribe();
+        loop {
+            if *built.borrow_and_update() {
+                return Ok(());
+            }
+            match &*startup.borrow_and_update() {
+                Startup::Pending => {}
+                // Ready without `built` cannot happen today, but a Ready
+                // stack has self-evidently finished building.
+                Startup::Ready => return Ok(()),
+                Startup::Failed(reason) => return Err(reason.clone()),
+            }
+            tokio::select! {
+                changed = built.changed() => {
+                    if changed.is_err() {
+                        return Err("supervisor stopped".to_string());
+                    }
+                }
+                changed = startup.changed() => {
+                    if changed.is_err() {
+                        return Err("supervisor stopped".to_string());
+                    }
+                }
+            }
+        }
     }
 
     /// Block until startup has settled. Returns immediately for a caller that
@@ -360,6 +405,46 @@ mod tests {
 
         tracker.finish_startup(Startup::Ready);
         assert_eq!(waiter.await.expect("waiter task"), Startup::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_build_waiter_settles_when_the_stage_does() {
+        let tracker = StateTracker::default();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_built().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tracker.finish_builds();
+        assert_eq!(waiter.await.expect("waiter task"), Ok(()));
+    }
+
+    /// A broken build fails startup without ever finishing the stage; the
+    /// waiter has to hear that reason rather than hold forever.
+    #[tokio::test]
+    async fn a_build_waiter_hears_a_startup_failure_instead() {
+        let tracker = StateTracker::default();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_built().await }
+        });
+
+        tracker.finish_startup(Startup::Failed("build for 'api' failed".to_string()));
+        assert_eq!(
+            waiter.await.expect("waiter task"),
+            Err("build for 'api' failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_build_waiter_still_gets_the_answer() {
+        let tracker = StateTracker::default();
+        tracker.finish_builds();
+
+        assert_eq!(tracker.wait_built().await, Ok(()));
     }
 
     #[tokio::test]

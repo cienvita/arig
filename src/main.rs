@@ -35,9 +35,9 @@ enum Commands {
     Init,
     /// Build and start all services
     Up {
-        /// Run the supervisor in the background; the CLI returns once the
-        /// supervisor is accepting commands, not once the services are ready.
-        /// Use `arig wait` for that.
+        /// Run the supervisor in the background; the CLI returns once every
+        /// build has finished, not once the services are ready. Use
+        /// `arig wait` for that.
         #[arg(short = 'd', long = "detach")]
         detach: bool,
         /// Start the services as they are, without running any `build:` first
