@@ -74,8 +74,11 @@ running. `arig restart --build <service>` builds first and leaves the running
 instance alone if the build fails.
 
 Lifecycle commands take `--timeout` (default 2m), and are refused while the
-stack is still starting. One command per service at a time; a second is
-refused rather than queued.
+stack is still starting. One command per service at a time: while a service is
+being built, stopped or spawned, a second command for it is refused rather than
+queued. A start that has spawned and is only waiting on its readiness probe is
+not holding the service, so a command arriving then takes it over and the
+waiting one reports that it was superseded.
 
 ## Runtimes
 

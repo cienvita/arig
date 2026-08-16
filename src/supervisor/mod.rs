@@ -101,6 +101,16 @@ enum Started {
     Probing,
 }
 
+impl InFlight {
+    /// Whether this command still has work of its own under way. A start that
+    /// has spawned and is only watching a probe does not: the service is up,
+    /// and a command arriving now can take it over rather than be refused
+    /// until a probe nobody is waiting on gives up.
+    fn holds_the_service(&self) -> bool {
+        !self.plan.is_empty() || matches!(self.task, Some(Task::Work(_)))
+    }
+}
+
 impl Steady {
     /// Finish a command and answer its client. Every path out of a command
     /// ends here, so a client is never left holding a connection that will
@@ -717,12 +727,17 @@ impl Kernel {
             }
         };
 
-        // A start that already answered its client is only still here to
-        // watch its probe; the new command takes the service over.
-        if let Some(previous) = steady.inflight.remove(&name)
-            && let Some(Task::Probe(task)) = previous.task
-        {
-            task.abort();
+        // Whatever was here is only watching a probe, so the new command takes
+        // the service over. A client still waiting on the old one hears why:
+        // it may have given up on its own timeout long ago, and the probe it
+        // left behind must not lock the service out of every later command.
+        if let Some(mut previous) = steady.inflight.remove(&name) {
+            if let Some(Task::Probe(task)) = previous.task.take() {
+                task.abort();
+            }
+            if let Some(reply) = previous.reply.take() {
+                let _ = reply.send(Err(format!("superseded by a later command on '{name}'")));
+            }
         }
         let seq = steady.next_seq;
         steady.next_seq += 1;
@@ -754,12 +769,10 @@ impl Kernel {
                 "'{name}' is a oneshot; lifecycle commands apply to long-running services"
             ));
         }
-        // An entry whose client has been answered and whose phases are done
-        // is a probe still being watched, which nothing needs to wait for.
         if steady
             .inflight
             .get(name)
-            .is_some_and(|entry| entry.reply.is_some() || !entry.plan.is_empty())
+            .is_some_and(InFlight::holds_the_service)
         {
             return Err(format!("operation in progress on '{name}'"));
         }
@@ -2577,6 +2590,51 @@ mod tests {
                     .command(stop("api"))
                     .await
                     .expect("a probe nobody is waiting for must not refuse the next command");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+    }
+
+    /// A client gives up on its own timeout while the kernel is still watching
+    /// the probe it asked for. The service is up and nothing is being changed,
+    /// so the next command takes it over rather than being refused for as long
+    /// as the probe keeps retrying.
+    #[tokio::test]
+    async fn a_command_supersedes_one_left_waiting_on_a_probe() {
+        let probe = Arc::new(FakeProbe::new(true));
+        let switch = probe.switch();
+        let ran = with_stack(
+            &[("api", &[])],
+            Setup {
+                probe: Some(probe),
+                probe_timeout: Duration::from_secs(60),
+                ..Setup::default()
+            },
+            async |stack| {
+                stack.command(stop("api")).await.expect("stop 'api'");
+                switch.store(false, Ordering::SeqCst);
+
+                // Nothing waits on this: it stands in for a client that has
+                // hung up, leaving the probe retrying behind it.
+                let abandoned = stack.send(start("api"));
+                stack
+                    .until("'api' spawned and probing", |s| {
+                        s.row("api").status == "running"
+                    })
+                    .await;
+
+                stack
+                    .command(stop("api"))
+                    .await
+                    .expect("a probe nobody is waiting on must not lock the service");
+
+                let superseded = abandoned
+                    .await
+                    .expect("the kernel answers every command")
+                    .expect_err("the command that was taken over did not finish");
+                assert!(superseded.contains("superseded"), "got: {superseded}");
             },
         )
         .await;

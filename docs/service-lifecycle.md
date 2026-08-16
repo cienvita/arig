@@ -55,11 +55,20 @@ only for a service that is not running, since one that is stays running
 while it builds.
 
 Lifecycle mutations for a given service are serialized through the kernel:
-it handles one message at a time, and a command for a service that already
-has one in flight is refused rather than queued. Two clients issuing
+it handles one message at a time, and a command for a service that is being
+built, stopped or spawned is refused rather than queued. Two clients issuing
 `restart api` and `down` concurrently do not race two starts or interleave
 a start with a teardown; `down` wins, abandoning a readiness probe and
 waiting out a stop that is already under way.
+
+A start that has spawned and is only watching its probe is the exception.
+It holds nothing: the service is up, and the client may well have given up
+on its own timeout already, since the probe is bounded by `ready.timeout`
+rather than by anything the client said. A command arriving then takes the
+service over, and the waiting one is answered with what happened to it.
+Every phase carries the identity of the command that started it, so a
+completion that arrives after its command is over is dropped rather than
+advancing whichever command holds the service by then.
 
 ## Desired state vs actual state
 
