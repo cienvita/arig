@@ -53,6 +53,12 @@ pub enum Phase {
     Start,
 }
 
+/// Which command a completion belongs to. A phase runs outside the kernel
+/// loop, so its message can arrive after the command that started it is over;
+/// the kernel drops one that no longer matches rather than advancing whatever
+/// command holds the service now.
+pub type Seq = u64;
+
 /// What the kernel handles between service exits. Everything that has to
 /// reach the loop arrives as one of these, since the loop owns the services
 /// and nothing else can touch them.
@@ -64,15 +70,17 @@ pub enum KernelMsg {
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// A service the kernel handed to a stop task is gone.
-    StopFinished { name: String },
+    StopFinished { name: String, seq: Seq },
     /// A readiness probe the kernel started has passed or given up.
     ProbeSettled {
         name: String,
+        seq: Seq,
         result: Result<(), String>,
     },
     /// A build the kernel started has ended.
     BuildFinished {
         name: String,
+        seq: Seq,
         result: Result<(), String>,
     },
 }

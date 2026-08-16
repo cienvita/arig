@@ -15,7 +15,7 @@ use crate::state::{self, Startup, StateTracker};
 use anyhow::Context;
 use futures::future::select_all;
 use logs::{LastOutput, LogTail};
-use msg::{KernelMsg, LifecycleReq, Phase};
+use msg::{KernelMsg, LifecycleReq, Phase, Seq};
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -28,9 +28,6 @@ use tokio::sync::{mpsc, oneshot};
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-/// Depth of the kernel's command channel. Only has to absorb clients arriving
-/// while the loop is busy with one of them.
-const COMMAND_QUEUE: usize = 64;
 
 /// A service the kernel is responsible for: the runtime's handle on it, plus
 /// the log plumbing the kernel set up around it.
@@ -60,10 +57,14 @@ struct Steady {
     /// One entry per service with a command in flight. A second command for
     /// the same service is refused rather than queued.
     inflight: HashMap<String, InFlight>,
+    /// Handed to each command as it is accepted, so a phase reporting back
+    /// late can be told from the one running now.
+    next_seq: Seq,
 }
 
 /// A lifecycle command the kernel has accepted and not yet answered.
 struct InFlight {
+    seq: Seq,
     /// The client waiting on it. Taken when the command settles, or when a
     /// `--no-wait` start has got as far as the client asked for.
     reply: Option<oneshot::Sender<Result<(), String>>>,
@@ -127,6 +128,19 @@ impl Steady {
             entry.task = None;
         }
     }
+
+    /// Whether a completion belongs to the command this service is running
+    /// now. One from a command that is already over says nothing about it.
+    fn is_current(&self, name: &str, seq: Seq) -> bool {
+        self.inflight
+            .get(name)
+            .is_some_and(|entry| entry.seq == seq)
+    }
+
+    /// Which command a phase about to be spawned belongs to.
+    fn seq_of(&self, name: &str) -> Seq {
+        self.inflight.get(name).map(|entry| entry.seq).unwrap_or(0)
+    }
 }
 
 struct IpcCleanup(ipc::Endpoint);
@@ -155,8 +169,12 @@ struct Kernel {
     /// it tells the reader to do to stop it: there is no tty to ctrl-c.
     detached: bool,
     /// Handed to everything that has to reach the loop: the IPC clients that
-    /// issue lifecycle commands, and the tasks running their phases.
-    msg_tx: mpsc::Sender<KernelMsg>,
+    /// issue lifecycle commands, and the tasks running their phases. Unbounded
+    /// on purpose: the kernel waits out a phase task on the way down, and a
+    /// bounded queue that filled would leave that task blocked on a send
+    /// nobody is draining. The queue is bounded in practice by the number of
+    /// connected clients.
+    msg_tx: mpsc::UnboundedSender<KernelMsg>,
 }
 
 pub async fn up(
@@ -200,7 +218,7 @@ pub async fn up(
     let listener = ipc::bind(&endpoint)?;
     let _ipc_cleanup = IpcCleanup(endpoint.clone());
     let acceptor = ipc::Acceptor::new(listener, endpoint.address.clone());
-    let (msg_tx, msg_rx) = mpsc::channel(COMMAND_QUEUE);
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let _ipc_task = tokio::spawn(ipc_accept_loop(
         acceptor,
         state.clone(),
@@ -359,7 +377,7 @@ impl Kernel {
         first
     }
 
-    async fn run(&self, msg_rx: mpsc::Receiver<KernelMsg>) -> anyhow::Result<()> {
+    async fn run(&self, msg_rx: mpsc::UnboundedReceiver<KernelMsg>) -> anyhow::Result<()> {
         let waves = dag::toposort(&self.config)?;
         self.validate_services()?;
         let mut probes = self.resolve_probes()?;
@@ -515,6 +533,7 @@ impl Kernel {
                 .flat_map(|(idx, wave)| wave.iter().map(move |name| (name.clone(), idx)))
                 .collect(),
             inflight: HashMap::new(),
+            next_seq: 0,
         };
         self.steady_state(&mut steady, msg_rx).await
     }
@@ -525,7 +544,7 @@ impl Kernel {
     async fn steady_state(
         &self,
         steady: &mut Steady,
-        mut msg_rx: mpsc::Receiver<KernelMsg>,
+        mut msg_rx: mpsc::UnboundedReceiver<KernelMsg>,
     ) -> anyhow::Result<()> {
         let mut rx = self.shutdown_rx.clone();
         loop {
@@ -623,11 +642,17 @@ impl Kernel {
     async fn handle(&self, steady: &mut Steady, message: KernelMsg) {
         match message {
             KernelMsg::Lifecycle { req, reply } => self.accept(steady, req, reply).await,
-            KernelMsg::StopFinished { name } => {
+            KernelMsg::StopFinished { name, seq } => {
+                if !steady.is_current(&name, seq) {
+                    return;
+                }
                 steady.clear_task(&name);
                 self.advance(steady, &name).await;
             }
-            KernelMsg::ProbeSettled { name, result } => {
+            KernelMsg::ProbeSettled { name, seq, result } => {
+                if !steady.is_current(&name, seq) {
+                    return;
+                }
                 steady.clear_task(&name);
                 match result {
                     Ok(()) => self.advance(steady, &name).await,
@@ -637,7 +662,10 @@ impl Kernel {
                     Err(reason) => steady.settle(&name, Err(reason)),
                 }
             }
-            KernelMsg::BuildFinished { name, result } => {
+            KernelMsg::BuildFinished { name, seq, result } => {
+                if !steady.is_current(&name, seq) {
+                    return;
+                }
                 steady.clear_task(&name);
                 match result {
                     Ok(()) => self.advance(steady, &name).await,
@@ -680,9 +708,19 @@ impl Kernel {
             }
         };
 
+        // A start that already answered its client is only still here to
+        // watch its probe; the new command takes the service over.
+        if let Some(previous) = steady.inflight.remove(&name)
+            && let Some(Task::Probe(task)) = previous.task
+        {
+            task.abort();
+        }
+        let seq = steady.next_seq;
+        steady.next_seq += 1;
         steady.inflight.insert(
             name.clone(),
             InFlight {
+                seq,
                 reply: Some(reply),
                 no_wait: req.no_wait(),
                 plan,
@@ -707,7 +745,13 @@ impl Kernel {
                 "'{name}' is a oneshot; lifecycle commands apply to long-running services"
             ));
         }
-        if steady.inflight.contains_key(name) {
+        // An entry whose client has been answered and whose phases are done
+        // is a probe still being watched, which nothing needs to wait for.
+        if steady
+            .inflight
+            .get(name)
+            .is_some_and(|entry| entry.reply.is_some() || !entry.plan.is_empty())
+        {
             return Err(format!("operation in progress on '{name}'"));
         }
 
@@ -880,20 +924,21 @@ impl Kernel {
         });
         event!(self.bus, "arig: building '{name}'");
 
+        let seq = steady.seq_of(name);
         let bus = self.bus.clone();
         let msg_tx = self.msg_tx.clone();
+        let shutdown = self.shutdown_rx.clone();
         let building = name.to_string();
         let task = tokio::spawn(async move {
-            let result = run_build(&bus, runtime.as_ref(), &building, &plan).await;
+            let result = run_build(&bus, runtime.as_ref(), &building, &plan, shutdown).await;
             bus.emit(Event::BuildFinished {
                 name: building.clone(),
             });
-            let _ = msg_tx
-                .send(KernelMsg::BuildFinished {
-                    name: building,
-                    result,
-                })
-                .await;
+            let _ = msg_tx.send(KernelMsg::BuildFinished {
+                name: building,
+                seq,
+                result,
+            });
         });
 
         if let Some(entry) = steady.inflight.get_mut(name) {
@@ -915,6 +960,7 @@ impl Kernel {
         });
         event!(self.bus, "arig: stopping '{name}'");
 
+        let seq = steady.seq_of(name);
         let bus = self.bus.clone();
         let msg_tx = self.msg_tx.clone();
         let stopping = name.to_string();
@@ -929,9 +975,10 @@ impl Kernel {
             bus.emit(Event::ServiceStopped {
                 name: stopping.clone(),
             });
-            let _ = msg_tx
-                .send(KernelMsg::StopFinished { name: stopping })
-                .await;
+            let _ = msg_tx.send(KernelMsg::StopFinished {
+                name: stopping,
+                seq,
+            });
         });
 
         if let Some(entry) = steady.inflight.get_mut(name) {
@@ -958,16 +1005,27 @@ impl Kernel {
             name: name.to_string(),
         });
         let wave = steady.wave_of.get(name).copied().unwrap_or(0);
-        let managed = self
+        let managed = match self
             .spawn_service(name, &service, wave, probe.is_some())
             .await
-            .map_err(|err| err.to_string())?;
+        {
+            Ok(managed) => managed,
+            Err(err) => {
+                // The row is Starting from the event above, and nothing is
+                // coming to move it on.
+                self.bus.emit(Event::ServiceStopped {
+                    name: name.to_string(),
+                });
+                return Err(err.to_string());
+            }
+        };
         steady.children.push(managed);
 
         let Some(pending) = probe else {
             return Ok(Started::Spawned);
         };
 
+        let seq = steady.seq_of(name);
         let bus = self.bus.clone();
         let msg_tx = self.msg_tx.clone();
         let probing = name.to_string();
@@ -975,12 +1033,11 @@ impl Kernel {
             let result = wait_ready(&bus, &probing, &pending)
                 .await
                 .map_err(|err| err.to_string());
-            let _ = msg_tx
-                .send(KernelMsg::ProbeSettled {
-                    name: probing,
-                    result,
-                })
-                .await;
+            let _ = msg_tx.send(KernelMsg::ProbeSettled {
+                name: probing,
+                seq,
+                result,
+            });
         });
 
         if let Some(entry) = steady.inflight.get_mut(name) {
@@ -1082,7 +1139,7 @@ async fn ipc_accept_loop(
     state: StateTracker,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     bus: Bus,
-    msg_tx: mpsc::Sender<KernelMsg>,
+    msg_tx: mpsc::UnboundedSender<KernelMsg>,
 ) {
     loop {
         let stream = match acceptor.accept().await {
@@ -1104,7 +1161,7 @@ async fn handle_client(
     state: StateTracker,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     bus: Bus,
-    msg_tx: mpsc::Sender<KernelMsg>,
+    msg_tx: mpsc::UnboundedSender<KernelMsg>,
 ) {
     let (rd, mut wr) = tokio::io::split(stream);
     let req = match protocol::read_request(rd).await {
@@ -1169,7 +1226,7 @@ async fn handle_client(
 /// answers, the way `wait` does. The client owns the timeout.
 async fn lifecycle(
     state: &StateTracker,
-    msg_tx: &mpsc::Sender<KernelMsg>,
+    msg_tx: &mpsc::UnboundedSender<KernelMsg>,
     req: LifecycleReq,
 ) -> protocol::Response {
     // The kernel only drains its command channel once it is past startup, so
@@ -1180,11 +1237,7 @@ async fn lifecycle(
     }
 
     let (reply, answer) = oneshot::channel();
-    if msg_tx
-        .send(KernelMsg::Lifecycle { req, reply })
-        .await
-        .is_err()
-    {
+    if msg_tx.send(KernelMsg::Lifecycle { req, reply }).is_err() {
         return protocol::Response::err("the supervisor is not accepting commands");
     }
     match answer.await {
@@ -1283,6 +1336,7 @@ async fn run_build(
     runtime: &dyn crate::runtime::Runtime,
     name: &str,
     plan: &ServiceConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut spawned = runtime
         .spawn(name, plan)
@@ -1293,14 +1347,27 @@ async fn run_build(
     let last_output: LastOutput = Arc::new(Mutex::new(Instant::now()));
     let mut io_tasks = logs::pipe_output(&mut spawned, name, &tail, &last_output, bus);
 
-    let outcome = wait_oneshot(
-        bus,
-        name,
-        spawned.handle.as_mut(),
-        plan.timeout,
-        last_output.clone(),
-    )
-    .await;
+    // A build has no timeout unless the operator set one, and the kernel waits
+    // this task out before it stops anything, so a build that outlives the
+    // shutdown request would hold the whole stack up. Kill it instead: nothing
+    // is going to use what it produces.
+    let settled = tokio::select! {
+        outcome = wait_oneshot(
+            bus,
+            name,
+            spawned.handle.as_mut(),
+            plan.timeout,
+            last_output.clone(),
+        ) => Some(outcome),
+        _ = shutdown.changed() => None,
+    };
+    let Some(outcome) = settled else {
+        spawned.handle.kill().await;
+        drain_io(&mut io_tasks).await;
+        return Err(format!(
+            "the build for '{name}' was stopped by the supervisor shutting down"
+        ));
+    };
     drain_io(&mut io_tasks).await;
 
     match outcome {
@@ -1422,6 +1489,7 @@ mod tests {
     use crate::registry::DEFAULT_RUNTIME;
     use crate::runtime::{Runtime, SpawnedService};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::broadcast::error::RecvError;
 
     /// What the kernel asked of the services, in the order it asked.
@@ -1457,6 +1525,9 @@ mod tests {
         hold: Option<Arc<tokio::sync::Notify>>,
         /// What every oneshot, builds included, exits with.
         oneshot_exit: i64,
+        /// Once set, every spawn fails, standing in for a command that cannot
+        /// be run or an image that will not pull.
+        spawn_fails: Option<Arc<AtomicBool>>,
     }
 
     #[async_trait]
@@ -1468,6 +1539,11 @@ mod tests {
         }
 
         async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService> {
+            if let Some(fails) = &self.spawn_fails
+                && fails.load(Ordering::SeqCst)
+            {
+                anyhow::bail!("nothing to run '{name}' with");
+            }
             self.spawns
                 .record(format!("{name} {}", spec.command.as_deref().unwrap_or("-")));
             // A oneshot has to end for the wave to move on, and a crasher has
@@ -1544,9 +1620,23 @@ mod tests {
     }
 
     /// Stands in for a real probe so readiness can be driven without anything
-    /// to connect to.
+    /// to connect to. What it answers is shared and settable, so a test can
+    /// have a service come up and then stop being ready.
     struct FakeProbe {
-        passes: bool,
+        passes: Arc<AtomicBool>,
+    }
+
+    impl FakeProbe {
+        fn new(passes: bool) -> Self {
+            Self {
+                passes: Arc::new(AtomicBool::new(passes)),
+            }
+        }
+
+        /// A handle on the answer, for a test that changes it mid-run.
+        fn switch(&self) -> Arc<AtomicBool> {
+            self.passes.clone()
+        }
     }
 
     impl Probe for FakeProbe {
@@ -1561,14 +1651,14 @@ mod tests {
         fn prepare(&self, spec: &ReadyProbe) -> anyhow::Result<Box<dyn ReadyCheck>> {
             Ok(Box::new(FakeCheck {
                 target: spec.tcp.clone().unwrap_or_default(),
-                passes: self.passes,
+                passes: self.passes.clone(),
             }))
         }
     }
 
     struct FakeCheck {
         target: String,
-        passes: bool,
+        passes: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -1578,7 +1668,7 @@ mod tests {
         }
 
         async fn check(&self) -> Result<(), String> {
-            if self.passes {
+            if self.passes.load(Ordering::SeqCst) {
                 Ok(())
             } else {
                 Err("nothing there".to_string())
@@ -1603,12 +1693,13 @@ mod tests {
         }
     }
 
-    /// A block the fake probe claims. Zero timeout so a probe that never
-    /// passes gives up on its first attempt instead of retrying for a minute.
-    fn ready_block() -> ReadyProbe {
+    /// A block the fake probe claims. The timeout is zero by default, so a
+    /// probe that never passes gives up on its first attempt instead of
+    /// retrying for a minute.
+    fn ready_block(timeout: Duration) -> ReadyProbe {
         ReadyProbe {
             tcp: Some("wherever:1".to_string()),
-            timeout: Duration::ZERO,
+            timeout,
         }
     }
 
@@ -1632,6 +1723,11 @@ mod tests {
         oneshot_exit: i64,
         /// Parks every stop until the test releases it.
         hold: Option<Arc<tokio::sync::Notify>>,
+        /// How long a readiness probe keeps retrying. Zero gives up on the
+        /// first attempt, which is what most tests want.
+        probe_timeout: Duration,
+        /// Flipped on by a test to make every spawn from then on fail.
+        spawn_fails: Option<Arc<AtomicBool>>,
     }
 
     /// What a run left behind.
@@ -1661,8 +1757,8 @@ mod tests {
     /// answer.
     struct Stack {
         kernel: Option<Kernel>,
-        msg_rx: Option<mpsc::Receiver<KernelMsg>>,
-        msg_tx: mpsc::Sender<KernelMsg>,
+        msg_rx: Option<mpsc::UnboundedReceiver<KernelMsg>>,
+        msg_tx: mpsc::UnboundedSender<KernelMsg>,
         shutdown_tx: tokio::sync::watch::Sender<bool>,
         bus: Bus,
         collected: tokio::sync::broadcast::Receiver<Event>,
@@ -1683,7 +1779,7 @@ mod tests {
         let bus = Bus::new(256);
         let collected = bus.subscribe();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (msg_tx, msg_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let log = Journal::default();
         let spawns = Journal::default();
         let state = StateTracker::default();
@@ -1697,6 +1793,7 @@ mod tests {
             crashes: setup.crashes,
             hold: setup.hold,
             oneshot_exit: setup.oneshot_exit,
+            spawn_fails: setup.spawn_fails,
         }));
         let ready = setup.probe.is_some();
         if let Some(probe) = setup.probe {
@@ -1708,7 +1805,10 @@ mod tests {
             None => {
                 let mut config: HashMap<String, ServiceConfig> = services
                     .iter()
-                    .map(|(name, deps)| (name.to_string(), service(deps, ready.then(ready_block))))
+                    .map(|(name, deps)| {
+                        let block = ready.then(|| ready_block(setup.probe_timeout));
+                        (name.to_string(), service(deps, block))
+                    })
                     .collect();
                 for name in &setup.oneshots {
                     config
@@ -1780,16 +1880,14 @@ mod tests {
         async fn command(&self, req: LifecycleReq) -> Result<(), String> {
             self.send(req)
                 .await
-                .await
                 .expect("the kernel answers every command")
         }
 
         /// Issue a command without waiting for its answer.
-        async fn send(&self, req: LifecycleReq) -> oneshot::Receiver<Result<(), String>> {
+        fn send(&self, req: LifecycleReq) -> oneshot::Receiver<Result<(), String>> {
             let (reply, answer) = oneshot::channel();
             self.msg_tx
                 .send(KernelMsg::Lifecycle { req, reply })
-                .await
                 .map_err(|_| "the kernel takes commands")
                 .expect("send");
             answer
@@ -1835,6 +1933,24 @@ mod tests {
 
         fn is_running(&self) -> bool {
             !self.running.as_ref().expect("kernel task").is_finished()
+        }
+
+        /// Ask the stack to shut down without waiting for it, the way ctrl-c
+        /// does mid-command.
+        fn interrupt(&self) {
+            let _ = self.shutdown_tx.send(true);
+        }
+
+        /// Give the kernel and its tasks a chance to reach `condition`. Bounded
+        /// so a regression fails the test rather than hanging it.
+        async fn until(&mut self, what: &str, mut condition: impl FnMut(&mut Stack) -> bool) {
+            for _ in 0..1000 {
+                if condition(self) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the stack never reached: {what}");
         }
 
         /// Shut the stack down and report what it left behind.
@@ -1987,7 +2103,7 @@ mod tests {
         let ran = run_to_shutdown(
             &[("db", &[]), ("api", &["db"])],
             Setup {
-                probe: Some(Arc::new(FakeProbe { passes: true })),
+                probe: Some(Arc::new(FakeProbe::new(true))),
                 ..Setup::default()
             },
         )
@@ -2004,7 +2120,7 @@ mod tests {
         let ran = run_to_shutdown(
             &[("db", &[])],
             Setup {
-                probe: Some(Arc::new(FakeProbe { passes: true })),
+                probe: Some(Arc::new(FakeProbe::new(true))),
                 ..Setup::default()
             },
         )
@@ -2073,7 +2189,7 @@ mod tests {
         let ran = run_to_shutdown(
             &[("api", &[])],
             Setup {
-                probe: Some(Arc::new(FakeProbe { passes: false })),
+                probe: Some(Arc::new(FakeProbe::new(false))),
                 ..Setup::default()
             },
         )
@@ -2114,7 +2230,7 @@ mod tests {
         let mut stack = build(
             &[("api", &[])],
             Setup {
-                probe: Some(Arc::new(FakeProbe { passes: false })),
+                probe: Some(Arc::new(FakeProbe::new(false))),
                 ..Setup::default()
             },
         );
@@ -2185,7 +2301,7 @@ mod tests {
         let ran = with_stack(
             &[("api", &[])],
             Setup {
-                probe: Some(Arc::new(FakeProbe { passes: true })),
+                probe: Some(Arc::new(FakeProbe::new(true))),
                 ..Setup::default()
             },
             async |stack| {
@@ -2215,7 +2331,7 @@ mod tests {
             async |stack| {
                 // Parked in finish_stop until the notify below, so the second
                 // command arrives while the first is still under way.
-                let first = stack.send(stop("api")).await;
+                let first = stack.send(stop("api"));
                 let refused = stack
                     .command(stop("api"))
                     .await
@@ -2285,6 +2401,150 @@ mod tests {
         .await
         .result
         .expect("clean shutdown");
+    }
+
+    /// Shutting down while a stop is under way has to wait that stop out: the
+    /// service is in a task rather than in the children, so the teardown below
+    /// would otherwise walk straight past it and leave it running.
+    #[tokio::test]
+    async fn a_shutdown_waits_out_a_stop_already_under_way() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let released = hold.clone();
+        let ran = with_stack(
+            &[("api", &[])],
+            Setup {
+                hold: Some(hold),
+                ..Setup::default()
+            },
+            async |stack| {
+                let answer = stack.send(stop("api"));
+                stack
+                    .until("a stop parked mid-flight", |s| {
+                        s.stops().contains(&"finish api".to_string())
+                    })
+                    .await;
+
+                stack.interrupt();
+                released.notify_one();
+
+                let refused = answer
+                    .await
+                    .expect("the kernel answers every command")
+                    .expect_err("a command caught by a shutdown is not a success");
+                assert!(refused.contains("shutting down"), "got: {refused}");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        // Stopped once, by the command, and not left behind for the teardown
+        // that cannot see it.
+        assert_eq!(ran.stops, ["begin api", "finish api"]);
+    }
+
+    /// A start whose spawn fails has already been reported as starting, and
+    /// nothing else is coming to move the row on.
+    #[tokio::test]
+    async fn a_start_that_cannot_spawn_does_not_leave_the_row_starting() {
+        let spawn_fails = Arc::new(AtomicBool::new(false));
+        let broken = spawn_fails.clone();
+        let ran = with_stack(
+            &[("api", &[])],
+            Setup {
+                spawn_fails: Some(spawn_fails),
+                ..Setup::default()
+            },
+            async |stack| {
+                stack.command(stop("api")).await.expect("stop 'api'");
+                broken.store(true, Ordering::SeqCst);
+
+                let failed = stack
+                    .command(start("api"))
+                    .await
+                    .expect_err("a spawn that fails fails the command");
+                assert!(failed.contains("nothing to run"), "got: {failed}");
+                assert_eq!(stack.row("api").status, "stopped");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        assert!(
+            ran.events
+                .iter()
+                .any(|e| matches!(e, Event::StartRequested { name } if name == "api")),
+            "the start was reported before it failed",
+        );
+    }
+
+    /// A probe that gives up is worth reporting, but the process it was
+    /// probing is up and stopping it is not this command's business.
+    #[tokio::test]
+    async fn a_probe_that_gives_up_fails_the_command_and_leaves_it_running() {
+        let probe = Arc::new(FakeProbe::new(true));
+        let switch = probe.switch();
+        let ran = with_stack(
+            &[("api", &[])],
+            Setup {
+                probe: Some(probe),
+                ..Setup::default()
+            },
+            async |stack| {
+                switch.store(false, Ordering::SeqCst);
+
+                let failed = stack
+                    .command(restart("api"))
+                    .await
+                    .expect_err("a probe that never passes fails the command");
+                assert!(failed.contains("nothing there"), "got: {failed}");
+
+                assert_eq!(stack.row("api").status, "running");
+                assert_eq!(stack.row("api").ready, crate::protocol::Readiness::Pending);
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+    }
+
+    /// `--no-wait` answers as soon as the service has spawned. The probe it
+    /// left running is nobody's business but the log's, so it must not hold
+    /// the service against the next command.
+    #[tokio::test]
+    async fn a_no_wait_start_does_not_hold_the_service() {
+        let probe = Arc::new(FakeProbe::new(true));
+        let switch = probe.switch();
+        let ran = with_stack(
+            &[("api", &[])],
+            Setup {
+                probe: Some(probe),
+                // Long enough that the probe is still retrying when the next
+                // command arrives.
+                probe_timeout: Duration::from_secs(60),
+                ..Setup::default()
+            },
+            async |stack| {
+                stack.command(stop("api")).await.expect("stop 'api'");
+                switch.store(false, Ordering::SeqCst);
+
+                let req = LifecycleReq::Start {
+                    service: "api".to_string(),
+                    no_wait: true,
+                };
+                stack
+                    .command(req)
+                    .await
+                    .expect("start 'api' without waiting");
+
+                stack
+                    .command(stop("api"))
+                    .await
+                    .expect("a probe nobody is waiting for must not refuse the next command");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
     }
 
     /// A config file only this test writes to, so the edits below are visible
