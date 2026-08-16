@@ -40,6 +40,12 @@ enum Commands {
         /// Use `arig wait` for that.
         #[arg(short = 'd', long = "detach")]
         detach: bool,
+        /// Start the services as they are, without running any `build:` first
+        #[arg(long)]
+        no_build: bool,
+        /// Give up on the build stage as a whole after this long, e.g. "5m"
+        #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
+        build_timeout: std::time::Duration,
     },
     /// Stop all services
     Down,
@@ -47,8 +53,10 @@ enum Commands {
     Ps,
     /// Block until every service has started and every readiness probe passed
     Wait {
-        /// Give up after this long, e.g. "30s", "5m"
-        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        /// Give up after this long, e.g. "30s", "5m". Startup includes the
+        /// build stage, so the default covers `up --build-timeout` as well as
+        /// the time the services take to become ready.
+        #[arg(long, default_value = "12m", value_parser = humantime::parse_duration)]
         timeout: std::time::Duration,
     },
     /// Stop one service and leave the rest running
@@ -101,6 +109,10 @@ enum Commands {
         /// Absolute path to the workspace this supervisor manages.
         #[arg(long)]
         workspace: PathBuf,
+        #[arg(long)]
+        no_build: bool,
+        #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
+        build_timeout: std::time::Duration,
     },
 }
 
@@ -120,18 +132,36 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Init => init(),
-        Commands::Supervise { workspace } => {
+        Commands::Supervise {
+            workspace,
+            no_build,
+            build_timeout,
+        } => {
             std::env::set_current_dir(&workspace)
                 .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", workspace.display()))?;
             let config = config::ArigConfig::load(&cli.file)?;
-            supervisor::up(config, Some(cli.file), true).await
+            let opts = supervisor::UpOptions {
+                detached: true,
+                no_build,
+                build_timeout,
+            };
+            supervisor::up(config, Some(cli.file), opts).await
         }
-        Commands::Up { detach } => {
+        Commands::Up {
+            detach,
+            no_build,
+            build_timeout,
+        } => {
             let config = config::ArigConfig::load(&cli.file)?;
+            let opts = supervisor::UpOptions {
+                detached: detach,
+                no_build,
+                build_timeout,
+            };
             if detach {
-                supervisor::detach_and_exit(&cli.file).await
+                supervisor::detach_and_exit(&cli.file, &opts).await
             } else {
-                supervisor::up(config, Some(cli.file), false).await
+                supervisor::up(config, Some(cli.file), opts).await
             }
         }
         Commands::Down => {

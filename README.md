@@ -37,13 +37,32 @@ Reads `arig.yaml` in the current directory. Example:
 
 ## Commands
 
+`arig up` runs every service's `build:` before the first service starts, then
+brings the stack up. Building up front is what makes a failure cheap: nothing
+has started, so `up` fails with the build's own output and there is no
+half-up stack to tear down. Every failing build is reported, not just the
+first.
+
+Builds run concurrently and in no particular order. `depends_on` is the
+runtime graph and says nothing about whether one service's build consumes
+another's output, so arig does not order builds by it.
+
+`--no-build` skips the stage. `--build-timeout` (default 10m) bounds the
+stage as a whole, so a build with no `timeout:` of its own cannot hold
+startup open indefinitely; a service's own `timeout:` still bounds its
+individual build.
+
 `arig up -d` runs the supervisor in the background. It returns once the
-supervisor is accepting commands, which is before any service has started.
+supervisor is accepting commands, which is before any building or starting
+has happened.
 
 `arig wait` blocks until every wave is up and every readiness probe has
-passed, then exits 0. It exits non-zero, reporting why, if a probe never
-passes, a oneshot fails, a service exits while the stack is still coming up,
-or the timeout (`--timeout`, default 2m) elapses first.
+passed, then exits 0. It exits non-zero, reporting why, if a build fails, a
+probe never passes, a oneshot fails, a service exits while the stack is still
+coming up, or the timeout (`--timeout`, default 12m) elapses first. That
+default covers the build stage as well as the services becoming ready, which
+is why it is not tighter; the precise failures come from the supervisor
+rather than from it.
 
 `arig ps` lists what the supervisor is tracking. `STATUS` reports the process,
 `READY` reports the probe: a service is `running` and `pending` between
@@ -126,6 +145,8 @@ Command surface:
 
 Plugin platform:
 - [x] Docker runtime via bollard
+- [ ] Build backends behind `Runtime::build`, starting with a native docker
+      image build
 - [ ] Helm/k8s publish plugins
 - [ ] External plugin protocol
 - [ ] `arig mcp` server
