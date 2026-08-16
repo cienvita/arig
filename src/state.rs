@@ -77,6 +77,10 @@ struct Row {
     /// When the current instance started, and `None` once it is gone.
     started_at: Option<Instant>,
     depends_on: Vec<String>,
+    /// Whether this service has ever started. `restarts` counts the starts
+    /// after the first, and a row seeded by the build stage has not had one:
+    /// its first `ServiceStarted` is the start, not a restart.
+    ran: bool,
 }
 
 /// What `arig ps` reports, derived from the event stream so the bus stays the
@@ -89,6 +93,12 @@ pub struct StateTracker {
     /// the exits that decide the verdict have been applied, and events reach
     /// the tracker on a task of their own.
     startup: Arc<watch::Sender<Startup>>,
+    /// Settles once the build stage is over, well before startup does: `up
+    /// --detach` returns on this, so a broken build is reported to the
+    /// terminal that asked for it while the services' own startup stays
+    /// backgrounded. Set by the kernel, like `startup`, and covered by it: a
+    /// startup verdict of either kind also settles a build-stage waiter.
+    built: Arc<watch::Sender<bool>>,
 }
 
 impl Default for StateTracker {
@@ -96,6 +106,7 @@ impl Default for StateTracker {
         Self {
             services: Arc::default(),
             startup: Arc::new(watch::channel(Startup::Pending).0),
+            built: Arc::new(watch::channel(false).0),
         }
     }
 }
@@ -141,6 +152,44 @@ impl StateTracker {
         self.startup.borrow().clone()
     }
 
+    /// Record that the build stage is over and the waves are next.
+    pub fn finish_builds(&self) {
+        self.built.send_replace(true);
+    }
+
+    /// Block until the build stage is over, answering with the startup
+    /// failure if that verdict lands first: a broken build fails startup
+    /// without ever finishing the stage, and so does anything before it.
+    /// Returns immediately for a caller that arrives after the fact.
+    pub async fn wait_built(&self) -> Result<(), String> {
+        let mut built = self.built.subscribe();
+        let mut startup = self.startup.subscribe();
+        loop {
+            if *built.borrow_and_update() {
+                return Ok(());
+            }
+            match &*startup.borrow_and_update() {
+                Startup::Pending => {}
+                // Ready without `built` cannot happen today, but a Ready
+                // stack has self-evidently finished building.
+                Startup::Ready => return Ok(()),
+                Startup::Failed(reason) => return Err(reason.clone()),
+            }
+            tokio::select! {
+                changed = built.changed() => {
+                    if changed.is_err() {
+                        return Err("supervisor stopped".to_string());
+                    }
+                }
+                changed = startup.changed() => {
+                    if changed.is_err() {
+                        return Err("supervisor stopped".to_string());
+                    }
+                }
+            }
+        }
+    }
+
     /// Block until startup has settled. Returns immediately for a caller that
     /// arrives after the fact, so a late `arig wait` still gets the verdict.
     pub async fn wait_startup(&self) -> Startup {
@@ -178,7 +227,12 @@ impl StateTracker {
                 // its row, or `ps` would list it twice.
                 match services.iter_mut().find(|s| &s.name == name) {
                     Some(row) => {
-                        row.restarts += 1;
+                        // A row seeded by the build stage is starting for the
+                        // first time; only a row that has run before counts
+                        // this as a restart.
+                        if row.ran {
+                            row.restarts += 1;
+                        }
                         row.kind = kind.as_str().to_string();
                         row.wave = *wave;
                         row.pid = *pid;
@@ -187,6 +241,7 @@ impl StateTracker {
                         row.ready = ready;
                         row.started_at = Some(Instant::now());
                         row.depends_on = depends_on.clone();
+                        row.ran = true;
                     }
                     None => services.push(Row {
                         name: name.clone(),
@@ -199,6 +254,7 @@ impl StateTracker {
                         restarts: 0,
                         started_at: Some(Instant::now()),
                         depends_on: depends_on.clone(),
+                        ran: true,
                     }),
                 }
             }
@@ -235,19 +291,47 @@ impl StateTracker {
                 services.retain(|s| &s.name != name)
             }
             // Only a service with nothing running has anything to show for a
-            // build; one that is up stays up while it builds.
-            Event::BuildStarted { name } => {
-                if let Some(row) = services.iter_mut().find(|s| &s.name == name)
-                    && row.state == ServiceState::Stopped
-                {
-                    row.state = ServiceState::Building;
+            // build; one that is up stays up while it builds. A service with
+            // no row at all is `up`'s build stage getting to it before its
+            // first start, which is exactly when `ps` has nothing else to
+            // show — seed the row, or the stage reads as an empty stack.
+            Event::BuildStarted {
+                name,
+                wave,
+                kind,
+                depends_on,
+            } => match services.iter_mut().find(|s| &s.name == name) {
+                Some(row) => {
+                    if row.state == ServiceState::Stopped {
+                        row.state = ServiceState::Building;
+                    }
                 }
-            }
+                None => services.push(Row {
+                    name: name.clone(),
+                    kind: kind.as_str().to_string(),
+                    wave: *wave,
+                    pid: None,
+                    state: ServiceState::Building,
+                    desired: Desired::Up,
+                    ready: Readiness::Unchecked,
+                    restarts: 0,
+                    started_at: None,
+                    depends_on: depends_on.clone(),
+                    ran: false,
+                }),
+            },
             Event::BuildFinished { name } => {
                 if let Some(row) = services.iter_mut().find(|s| &s.name == name)
                     && row.state == ServiceState::Building
                 {
-                    row.state = ServiceState::Stopped;
+                    // Where the service goes next depends on where it came
+                    // from: a stopped service that was rebuilt is stopped
+                    // again, one seeded by `up`'s build stage is on its way
+                    // to its first start.
+                    row.state = match row.ran {
+                        true => ServiceState::Stopped,
+                        false => ServiceState::Starting,
+                    };
                 }
             }
             Event::ServiceExited { name, status } => {
@@ -360,6 +444,108 @@ mod tests {
 
         tracker.finish_startup(Startup::Ready);
         assert_eq!(waiter.await.expect("waiter task"), Startup::Ready);
+    }
+
+    /// During `up`'s build stage nothing has started, so the build events are
+    /// all there is: they seed the rows, or `ps` shows an empty table for as
+    /// long as the builds run.
+    #[test]
+    fn the_build_stage_seeds_the_rows_ps_shows() {
+        let tracker = StateTracker::default();
+        tracker.apply(&Event::BuildStarted {
+            name: "api".to_string(),
+            wave: 1,
+            kind: ServiceKind::Service,
+            depends_on: vec!["db".to_string()],
+        });
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status, "building");
+        assert_eq!(snapshot[0].wave, 1);
+        assert_eq!(snapshot[0].desired.as_deref(), Some("up"));
+
+        // Built but not yet started is on its way up, not stopped.
+        tracker.apply(&Event::BuildFinished {
+            name: "api".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].status, "starting");
+
+        // The first start of a seeded row is a start, not a restart.
+        tracker.apply(&started("api", 1, ServiceKind::Service, 22));
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot[0].status, "running");
+        assert_eq!(snapshot[0].restarts, 0);
+    }
+
+    /// The pre-existing shape: a stopped service that is rebuilt is stopped
+    /// again afterwards, and starting it after that is a restart.
+    #[test]
+    fn a_rebuilt_stopped_service_is_stopped_again() {
+        let tracker = StateTracker::default();
+        tracker.apply(&started("api", 0, ServiceKind::Service, 22));
+        tracker.apply(&Event::StopRequested {
+            name: "api".to_string(),
+        });
+        tracker.apply(&Event::ServiceStopped {
+            name: "api".to_string(),
+        });
+
+        tracker.apply(&Event::BuildStarted {
+            name: "api".to_string(),
+            wave: 0,
+            kind: ServiceKind::Service,
+            depends_on: Vec::new(),
+        });
+        assert_eq!(tracker.snapshot()[0].status, "building");
+
+        tracker.apply(&Event::BuildFinished {
+            name: "api".to_string(),
+        });
+        assert_eq!(tracker.snapshot()[0].status, "stopped");
+
+        tracker.apply(&started("api", 0, ServiceKind::Service, 23));
+        assert_eq!(tracker.snapshot()[0].restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_build_waiter_settles_when_the_stage_does() {
+        let tracker = StateTracker::default();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_built().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tracker.finish_builds();
+        assert_eq!(waiter.await.expect("waiter task"), Ok(()));
+    }
+
+    /// A broken build fails startup without ever finishing the stage; the
+    /// waiter has to hear that reason rather than hold forever.
+    #[tokio::test]
+    async fn a_build_waiter_hears_a_startup_failure_instead() {
+        let tracker = StateTracker::default();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_built().await }
+        });
+
+        tracker.finish_startup(Startup::Failed("build for 'api' failed".to_string()));
+        assert_eq!(
+            waiter.await.expect("waiter task"),
+            Err("build for 'api' failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_build_waiter_still_gets_the_answer() {
+        let tracker = StateTracker::default();
+        tracker.finish_builds();
+
+        assert_eq!(tracker.wait_built().await, Ok(()));
     }
 
     #[tokio::test]

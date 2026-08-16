@@ -18,6 +18,7 @@ use logs::{LastOutput, LogTail};
 use msg::{KernelMsg, LifecycleReq, Phase, Seq};
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -182,6 +183,12 @@ struct Kernel {
     /// Whether this supervisor was spawned by `up --detach`. Only affects what
     /// it tells the reader to do to stop it: there is no tty to ctrl-c.
     detached: bool,
+    /// Whether to skip the build stage and start the services as they are.
+    no_build: bool,
+    /// Ceiling on the build stage as a whole. A service's own `timeout:`
+    /// bounds its individual build; this bounds the lot, so a build with no
+    /// timeout of its own cannot hold startup open indefinitely.
+    build_timeout: Duration,
     /// Handed to everything that has to reach the loop: the IPC clients that
     /// issue lifecycle commands, and the tasks running their phases. Unbounded
     /// on purpose: the kernel waits out a phase task on the way down, and a
@@ -191,10 +198,20 @@ struct Kernel {
     msg_tx: mpsc::UnboundedSender<KernelMsg>,
 }
 
+/// What `up` was asked for, beyond the config itself.
+pub struct UpOptions {
+    /// Whether this supervisor was spawned by `up --detach`.
+    pub detached: bool,
+    /// Skip the build stage.
+    pub no_build: bool,
+    /// Ceiling on the build stage as a whole.
+    pub build_timeout: Duration,
+}
+
 pub async fn up(
     config: ArigConfig,
     config_path: Option<std::path::PathBuf>,
-    detached: bool,
+    opts: UpOptions,
 ) -> anyhow::Result<()> {
     #[cfg(windows)]
     let _job = platform::win::JobGuard::new()?;
@@ -250,7 +267,9 @@ pub async fn up(
         shutdown_tx: shutdown_tx.clone(),
         registry,
         state: state.clone(),
-        detached,
+        detached: opts.detached,
+        no_build: opts.no_build,
+        build_timeout: opts.build_timeout,
         msg_tx,
     };
     let result = kernel.run(msg_rx).await;
@@ -362,10 +381,120 @@ impl Kernel {
         Ok(())
     }
 
+    /// Run every service's build before the first wave spawns.
+    ///
+    /// Building up front rather than per wave is what makes a failure cheap:
+    /// nothing has started, so there is no half-up stack to tear down, and
+    /// `up` fails with the build's own output rather than with whatever the
+    /// services did in the meantime.
+    ///
+    /// Builds run concurrently, in no particular order. `depends_on` is the
+    /// runtime graph, not a build graph: it says nothing about whether one
+    /// service's build consumes another's output, and a library that is not a
+    /// service of its own does not appear in it at all. Ordering builds by it
+    /// would be wrong in both directions, so arig does not pretend to know.
+    async fn build_all(&self, waves: &[Vec<String>]) -> anyhow::Result<Builds> {
+        if self.no_build {
+            return Ok(Builds::Done);
+        }
+
+        // Sorted, so the same config logs its builds in the same order twice
+        // over. `services` is a map and iterates arbitrarily.
+        let mut names: Vec<&String> = self.config.services.keys().collect();
+        names.sort();
+
+        let mut planned = Vec::new();
+        for name in names {
+            let spec = &self.config.services[name];
+            let Some(plan) = self.registry.runtime(&spec.runtime)?.build(spec) else {
+                continue;
+            };
+            // The plan says which runtime runs it, which is not the runtime
+            // that runs the service: the default build is a host process
+            // whatever the service is.
+            let runner = self.registry.runtime(&plan.runtime)?.clone();
+            planned.push((name.clone(), runner, plan));
+        }
+        if planned.is_empty() {
+            return Ok(Builds::Done);
+        }
+
+        event!(self.bus, "arig: building {} service(s)...", planned.len());
+        let builds = planned.into_iter().map(|(name, runner, plan)| {
+            let bus = self.bus.clone();
+            let shutdown = self.shutdown_rx.clone();
+            // The event seeds the `ps` row for this stage, so it carries what
+            // the row needs: nothing has started, and there is nothing else
+            // to derive a row from.
+            let spec = &self.config.services[&name];
+            let wave = waves
+                .iter()
+                .position(|wave| wave.contains(&name))
+                .unwrap_or(0);
+            let kind = ServiceKind::from(&spec.service_type);
+            let depends_on = spec.depends_on.clone();
+            async move {
+                bus.emit(Event::BuildStarted {
+                    name: name.clone(),
+                    wave,
+                    kind,
+                    depends_on,
+                });
+                event!(bus, "arig: building '{name}'");
+                let result = run_build(&bus, runner.as_ref(), &name, &plan, shutdown).await;
+                bus.emit(Event::BuildFinished { name });
+                result
+            }
+        });
+
+        let mut all = Box::pin(futures::future::join_all(builds));
+        let results = tokio::select! {
+            results = &mut all => results,
+            _ = tokio::time::sleep(self.build_timeout) => {
+                // Dropping the builds here would leave their processes behind,
+                // so tell them the stack is going down, which is true, and
+                // collect them before reporting.
+                let _ = self.shutdown_tx.send(true);
+                all.await;
+                return Err(self.startup_failure(format!(
+                    "builds did not finish within {}",
+                    humantime::format_duration(self.build_timeout)
+                )));
+            }
+        };
+
+        // A shutdown while the stage was running cancels every build in
+        // flight, and each one reports itself cancelled. None of those is a
+        // build that failed, so answer for the stage rather than reporting a
+        // wall of them: the caller takes the same clean-stop path the waves
+        // take. Checked before the failures because a genuine failure racing
+        // the shutdown is still a stop the operator asked for. The stage
+        // timeout above requests the shutdown itself, and returns its own
+        // error before reaching this.
+        if *self.shutdown_rx.borrow() {
+            return Ok(Builds::Interrupted);
+        }
+
+        // Every failure, not just the first: three broken builds are three
+        // things to fix, and the next `up` should not find them one at a time.
+        let failures: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+        match failures.is_empty() {
+            true => Ok(Builds::Done),
+            false => Err(self.startup_failure(failures.join("; "))),
+        }
+    }
+
     /// Fail startup now, so anything blocked in `arig wait` hears the reason
     /// before the shutdown that follows rather than after it.
     fn fail_startup(&self, reason: impl Into<String>) {
         self.state.finish_startup(Startup::Failed(reason.into()));
+    }
+
+    /// Record a startup failure and return it, for the paths that report the
+    /// same reason to `arig wait` and to their own caller.
+    fn startup_failure(&self, reason: String) -> anyhow::Error {
+        self.fail_startup(reason.clone());
+        anyhow::anyhow!(reason)
     }
 
     /// Report every service already gone, and answer with the first of them.
@@ -396,6 +525,23 @@ impl Kernel {
         let waves = dag::toposort(&self.config)?;
         self.validate_services()?;
         let mut probes = self.resolve_probes()?;
+        // Last thing before anything spawns, and after everything that can be
+        // rejected on inspection has been: a config arig was never going to
+        // accept should not cost a build first.
+        match self.build_all(&waves).await? {
+            Builds::Interrupted => {
+                // The same clean stop the waves report, minus the tear-down
+                // they have to do: the whole point of building up front is
+                // that there is nothing started to take down here.
+                event!(self.bus, "\narig: shutting down...");
+                event!(self.bus, "arig: stopped before anything started.");
+                return Ok(());
+            }
+            // Settles the detaching `up` blocked on the build stage. Not
+            // folded into `build_all`, whose error path settles that waiter
+            // through `startup_failure` already.
+            Builds::Done => self.state.finish_builds(),
+        }
         let mut children: Vec<ManagedChild> = Vec::new();
 
         for (wave_idx, wave) in waves.iter().enumerate() {
@@ -941,8 +1087,12 @@ impl Kernel {
             }
         };
 
+        let spec = &self.config.services[name];
         self.bus.emit(Event::BuildStarted {
             name: name.to_string(),
+            wave: steady.wave_of.get(name).copied().unwrap_or(0),
+            kind: ServiceKind::from(&spec.service_type),
+            depends_on: spec.depends_on.clone(),
         });
         event!(self.bus, "arig: building '{name}'");
 
@@ -1084,6 +1234,15 @@ where
     select_all(waits).await.0
 }
 
+/// How the build stage ended, short of failing.
+enum Builds {
+    Done,
+    /// The supervisor was told to stop while the stage was still running.
+    /// Every build in flight reports itself cancelled, which is not a build
+    /// that failed: the operator asked for this.
+    Interrupted,
+}
+
 /// What the steady-state loop woke up for.
 enum Action {
     Message(KernelMsg),
@@ -1093,7 +1252,7 @@ enum Action {
 
 /// Spawn the current binary as a detached `__supervise` process, wait until it
 /// binds its IPC endpoint, then return. The caller process exits normally.
-pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
+pub async fn detach_and_exit(config_file: &Path, opts: &UpOptions) -> anyhow::Result<()> {
     // Pass cwd as-is to the child; Endpoint::for_workspace canonicalizes
     // internally for the hash. Canonicalizing here would yield `\\?\` paths on
     // Windows, which CMD.EXE refuses as a working directory for service
@@ -1121,6 +1280,11 @@ pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--file").arg(config_file);
     cmd.arg("__supervise").arg("--workspace").arg(&workspace);
+    if opts.no_build {
+        cmd.arg("--no-build");
+    }
+    cmd.arg("--build-timeout")
+        .arg(humantime::format_duration(opts.build_timeout).to_string());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(log.try_clone()?));
     cmd.stderr(Stdio::from(log));
@@ -1140,18 +1304,73 @@ pub async fn detach_and_exit(config_file: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let child = platform::spawn_detached(&mut cmd)?;
+    let mut child = platform::spawn_detached(&mut cmd)?;
     let pid = child.id();
     eprintln!("arig: spawned supervisor (pid {pid})");
 
-    match ipc::wait_ready(&endpoint, Duration::from_secs(10)).await {
+    // Watch the child alongside the socket. A supervisor that dies before it
+    // binds — bad config, endpoint in use — never answers, and waiting the
+    // full ten seconds to report that it never bound describes neither what
+    // happened nor where to look.
+    let bound = watch_child(
+        &mut child,
+        ipc::wait_ready(&endpoint, Duration::from_secs(10)),
+    )
+    .await;
+    if let Err(e) = bound {
+        anyhow::bail!("{e}. check {} for details", log_path.display());
+    }
+    eprintln!("arig: supervisor ready at {}", endpoint.address);
+
+    // Hold for the build stage before returning: this terminal is the only
+    // one that asked for the stack, so a broken build is its to hear, and
+    // `arig wait` should be about readiness rather than the only place a
+    // build failure surfaces. The supervisor's own `--build-timeout` bounds
+    // the stage, so the ceiling here is that plus slack for the answer to
+    // arrive; the child watch catches a supervisor that stops answering
+    // altogether, closed connection included, and names the exit instead.
+    let built = async {
+        let stream = ipc::connect(&endpoint).await.context("connect")?;
+        let exchange = protocol::exchange(stream, &protocol::Request::WaitBuilt);
+        let ceiling = opts.build_timeout + Duration::from_secs(10);
+        let resp = tokio::time::timeout(ceiling, exchange)
+            .await
+            .map_err(|_| anyhow::anyhow!("no answer on the build stage within {ceiling:?}"))??;
+        match resp.ok {
+            true => Ok(()),
+            false => Err(anyhow::anyhow!(
+                "{}",
+                resp.error.unwrap_or_else(|| "unknown".into())
+            )),
+        }
+    };
+    match watch_child(&mut child, built).await {
         Ok(()) => {
-            eprintln!("arig: supervisor ready at {}", endpoint.address);
             eprintln!("arig: log at {}", log_path.display());
             Ok(())
         }
         Err(e) => {
             anyhow::bail!("{e}. check {} for details", log_path.display());
+        }
+    }
+}
+
+/// Run `fut` to completion unless the supervisor exits first, in which case
+/// its exit status is the answer: a child that died will never answer, and
+/// "no answer" says neither what happened nor where to look.
+async fn watch_child<T>(
+    child: &mut std::process::Child,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            result = &mut fut => return result,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    anyhow::bail!("supervisor exited ({status}) before it was ready");
+                }
+            }
         }
     }
 }
@@ -1207,6 +1426,16 @@ async fn handle_client(
                 Startup::Ready => protocol::Response::ok(),
                 Startup::Failed(reason) => protocol::Response::err(reason),
                 Startup::Pending => protocol::Response::err("startup state unknown"),
+            };
+            let _ = protocol::write_response(&mut wr, &resp).await;
+        }
+        protocol::Request::WaitBuilt => {
+            // Like `Wait`: no deadline here, the client owns the timeout, and
+            // a build stage that fails answers with the reason rather than a
+            // closed connection.
+            let resp = match state.wait_built().await {
+                Ok(()) => protocol::Response::ok(),
+                Err(reason) => protocol::Response::err(reason),
             };
             let _ = protocol::write_response(&mut wr, &resp).await;
         }
@@ -1773,6 +2002,13 @@ mod tests {
         spawn_fails: Option<Arc<AtomicBool>>,
         /// Holds every build until the test releases it.
         build_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Skip the build stage, the way `up --no-build` does. Set by the
+        /// tests that drive `build` as a command, so the build they assert on
+        /// is the one they asked for rather than startup's.
+        no_build: bool,
+        /// Ceiling on the build stage. Zero stands for the default, since
+        /// most tests have nothing to build.
+        build_timeout: Duration,
         /// Holds the crasher's exit until the test releases it.
         crash_gate: Option<Arc<tokio::sync::Notify>>,
     }
@@ -1881,6 +2117,11 @@ mod tests {
             registry,
             state: state.clone(),
             detached: setup.detached,
+            no_build: setup.no_build,
+            build_timeout: match setup.build_timeout.is_zero() {
+                true => Duration::from_secs(600),
+                false => setup.build_timeout,
+            },
             msg_tx: msg_tx.clone(),
         };
 
@@ -2751,6 +2992,7 @@ mod tests {
             &[],
             Setup {
                 config_file: Some(path.clone()),
+                no_build: true,
                 ..Setup::default()
             },
             async |stack| {
@@ -2780,6 +3022,7 @@ mod tests {
             Setup {
                 config_file: Some(path.clone()),
                 oneshot_exit: 1,
+                no_build: true,
                 ..Setup::default()
             },
             async |stack| {
@@ -2833,6 +3076,7 @@ mod tests {
             &[],
             Setup {
                 config_file: Some(path.clone()),
+                no_build: true,
                 ..Setup::default()
             },
             async |stack| {
@@ -2850,6 +3094,206 @@ mod tests {
 
         ran.result.expect("clean shutdown");
         let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn up_builds_everything_before_the_first_service_starts() {
+        let path = temp_config(
+            "up-builds",
+            "services:\n  db:\n    command: db\n    build: make db\n\
+             \n  api:\n    command: run\n    build: make api\n    depends_on: [db]\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                ..Setup::default()
+            },
+            async |stack| {
+                let spawns = stack.spawns();
+                let at = |what: &str| {
+                    spawns
+                        .iter()
+                        .position(|spawn| spawn == what)
+                        .unwrap_or_else(|| panic!("no spawn '{what}' in {spawns:?}"))
+                };
+                // Not the order of the builds against each other: they run
+                // concurrently and arig promises nothing about which is first.
+                let first_start = at("db db");
+                assert!(at("db make db") < first_start, "got: {spawns:?}");
+                assert!(at("api make api") < first_start, "got: {spawns:?}");
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// The reason to build up front: a broken build costs nothing to unwind,
+    /// because nothing has started yet.
+    #[tokio::test]
+    async fn a_build_that_fails_stops_up_before_anything_starts() {
+        let path = temp_config(
+            "up-build-fails",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                oneshot_exit: 1,
+                ..Setup::default()
+            },
+            async |stack| {
+                assert_eq!(stack.spawns(), ["api make"], "the service must not start");
+                assert!(stack.stops().is_empty(), "there is nothing to tear down");
+            },
+        )
+        .await;
+
+        let Startup::Failed(reason) = ran.startup else {
+            panic!("a failed build fails startup");
+        };
+        assert!(reason.contains("build for 'api' failed"), "got: {reason}");
+        ran.result.expect_err("a build that fails fails the run");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// Three broken builds are three things to fix. Reporting only the first
+    /// would hand them over one `up` at a time.
+    #[tokio::test]
+    async fn every_build_that_fails_is_reported() {
+        let path = temp_config(
+            "up-builds-fail",
+            "services:\n  api:\n    command: run\n    build: make api\n\
+             \n  web:\n    command: run\n    build: make web\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                oneshot_exit: 1,
+                ..Setup::default()
+            },
+            async |_stack| {},
+        )
+        .await;
+
+        let Startup::Failed(reason) = ran.startup else {
+            panic!("a failed build fails startup");
+        };
+        assert!(reason.contains("build for 'api' failed"), "got: {reason}");
+        assert!(reason.contains("build for 'web' failed"), "got: {reason}");
+        ran.result.expect_err("a build that fails fails the run");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    #[tokio::test]
+    async fn no_build_starts_the_services_as_they_are() {
+        let path = temp_config(
+            "up-no-build",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                no_build: true,
+                ..Setup::default()
+            },
+            async |stack| {
+                assert_eq!(stack.spawns(), ["api run"]);
+            },
+        )
+        .await;
+
+        ran.result.expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// A service's own `timeout:` is opt-in, so without a ceiling on the
+    /// stage a build that never ends would hold startup open forever.
+    #[tokio::test]
+    async fn a_build_stage_that_outruns_its_timeout_fails_startup() {
+        let path = temp_config(
+            "up-build-timeout",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let ran = with_stack(
+            &[],
+            Setup {
+                config_file: Some(path.clone()),
+                // Parked with nothing to release it: the stage timeout is the
+                // only thing that ends this build.
+                build_gate: Some(Arc::new(tokio::sync::Notify::new())),
+                build_timeout: Duration::from_millis(50),
+                ..Setup::default()
+            },
+            async |stack| {
+                assert_eq!(stack.spawns(), ["api make"], "the service must not start");
+            },
+        )
+        .await;
+
+        let Startup::Failed(reason) = ran.startup else {
+            panic!("a build stage that never ends fails startup");
+        };
+        assert!(reason.contains("did not finish within"), "got: {reason}");
+        ran.result
+            .expect_err("a build stage that times out fails the run");
+        let _ = std::fs::remove_dir_all(path.parent().expect("config dir"));
+    }
+
+    /// Ctrl+C during the build stage is a stop the operator asked for, not a
+    /// build that failed. Every build in flight reports itself cancelled, and
+    /// counting those as failures turned a clean stop into a non-zero exit
+    /// with `the build for 'api' was stopped by the supervisor shutting down`
+    /// where every other interrupt point in startup exits 0.
+    ///
+    /// Driven directly rather than through `with_stack`, which waits out a
+    /// startup that a clean stop never finishes.
+    #[tokio::test]
+    async fn a_shutdown_during_the_build_stage_stops_cleanly() {
+        let path = temp_config(
+            "up-build-interrupted",
+            "services:\n  api:\n    command: run\n    build: make\n",
+        );
+        let cleanup = path.clone();
+        let local = tokio::task::LocalSet::new();
+        let (result, spawns) = local
+            .run_until(async move {
+                let mut stack = build(
+                    &[],
+                    Setup {
+                        config_file: Some(path),
+                        // Nothing releases the gate: the shutdown below is the
+                        // only thing that ends this build.
+                        build_gate: Some(Arc::new(tokio::sync::Notify::new())),
+                        ..Setup::default()
+                    },
+                );
+                let kernel = stack.kernel.take().expect("kernel");
+                let msg_rx = stack.msg_rx.take().expect("command channel");
+                let running = tokio::task::spawn_local(async move { kernel.run(msg_rx).await });
+
+                // Stop once the build is actually running, so the test covers
+                // a shutdown mid-stage rather than one that beat it there.
+                for _ in 0..200 {
+                    if !stack.spawns().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = stack.shutdown_tx.send(true);
+                let result = running.await.expect("kernel task");
+                (result, stack.spawns())
+            })
+            .await;
+
+        result.expect("a shutdown during the build stage is not a failure");
+        assert_eq!(spawns, ["api make"], "the service must not start");
+        let _ = std::fs::remove_dir_all(cleanup.parent().expect("config dir"));
     }
 
     /// The teardown after a crash waits out the work it cannot abandon, and a
@@ -2870,9 +3314,11 @@ mod tests {
                 config_file: Some(path.clone()),
                 crashes: Some("db".to_string()),
                 // The build is parked until the kernel gives up on it, which
-                // is the point: nothing else ends it.
+                // is the point: nothing else ends it. Startup must not run one
+                // of its own, or the gate holds the stack before it is up.
                 build_gate: Some(build_gate),
                 crash_gate: Some(crash_gate),
+                no_build: true,
                 ..Setup::default()
             },
             async |stack| {

@@ -12,6 +12,10 @@ pub enum Request {
     /// Block until every wave is up and every readiness probe has passed.
     /// The supervisor holds the connection open until then.
     Wait,
+    /// Block until the build stage is over, which is before the first wave
+    /// spawns. `up --detach` returns on this, so a broken build fails in the
+    /// terminal that asked for it.
+    WaitBuilt,
     /// Trigger supervisor shutdown.
     Down,
     /// Stop one service and leave the rest alone. The supervisor holds the
@@ -195,6 +199,12 @@ mod tests {
         };
         assert_eq!(service, "api");
         assert!(!no_wait);
+    }
+
+    #[test]
+    fn wait_built_goes_over_the_wire_as_one_word() {
+        let json = serde_json::to_string(&Request::WaitBuilt).expect("serialize");
+        assert_eq!(json, r#"{"op":"waitbuilt"}"#);
     }
 
     #[test]

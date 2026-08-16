@@ -83,9 +83,14 @@ pub enum Event {
     },
     /// A service's build has started. Builds run against a service that is
     /// still up as readily as against a stopped one, which is the point:
-    /// build first, stop second.
+    /// build first, stop second. Carries the same row-shaping fields as
+    /// `ServiceStarted`: during `up`'s build stage nothing has started, and
+    /// this event is all the tracker has to build a `ps` row from.
     BuildStarted {
         name: String,
+        wave: usize,
+        kind: ServiceKind,
+        depends_on: Vec<String>,
     },
     /// A service's build has ended. Whether it worked is the command's answer
     /// to its client and a line in the log; the state machine only needs to

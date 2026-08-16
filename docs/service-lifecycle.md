@@ -104,6 +104,30 @@ first cut.
 instance running and the command exits non-zero, so a broken edit does not
 take a working service down.
 
+`up` runs the same phase for every service before the first wave spawns,
+which `--no-build` skips. Up front rather than per wave, for the same reason
+`restart --build` builds before it stops: a failure has to be cheap. Nothing
+has started, so there is no half-up stack to unwind and the error the user
+sees is the build's own rather than whatever the services did meanwhile.
+
+Those builds run concurrently and unordered. `depends_on` is the runtime
+graph: it does not say whether one service's build consumes another's
+output, and a library that is not a service of its own never appears in it,
+so it is neither necessary nor sufficient as a build order. A real build
+graph would need declaring separately, and nothing yet needs one.
+
+`up --build-timeout` bounds the stage as a whole. A service's `timeout:` is
+opt-in and bounds only its own build, so without a ceiling on the stage a
+build that never ends holds startup open indefinitely.
+
+A detaching `up` holds for the stage rather than returning at socket bind, so
+the terminal that asked for the stack is the one that hears about a broken
+build. Returning earlier made that a race: a build that failed inside the
+parent's probe window read as a supervisor that died, and one that failed
+after it read as success, leaving the failure for whoever ran `arig wait`
+later. Holding also keeps `wait` about readiness, which is what its timeout
+is sized for.
+
 ## Dependents
 
 Stopping `db` while `api` depends on it touches only `db` by default. The
@@ -204,7 +228,8 @@ observation of transitions:
 
 1. Per-service state machine and desired state in the tracker. Done.
 2. `stop`, `start`, `restart` over IPC, blocking until ready. Done.
-3. `build:` config key, `arig build`, `restart --build`. Done.
+3. `build:` config key, `arig build`, `restart --build`, and `up` building
+   before it starts anything. Done.
 4. `run` for oneshots.
 5. Crash policy, watch mode, partial up as separate efforts.
 
