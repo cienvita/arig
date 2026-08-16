@@ -85,8 +85,9 @@ pub struct ServiceConfig {
     pub depends_on: Vec<String>,
     /// Optional readiness probe. Dependents wait until this passes.
     pub ready: Option<ReadyProbe>,
-    /// Maximum time a oneshot may run before it's killed and the wave fails.
-    /// Ignored for long-running services. e.g. "5m", "30s". No default: opt-in.
+    /// Maximum time a oneshot may run before it's killed and the wave fails,
+    /// and the same limit for this service's `build`. A long-running service's
+    /// own process is not bound by it. e.g. "5m", "30s". No default: opt-in.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,

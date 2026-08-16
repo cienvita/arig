@@ -129,7 +129,7 @@
           ]
         },
         "timeout": {
-          "description": "Maximum time a oneshot may run before it's killed and the wave fails.\nIgnored for long-running services. e.g. \"5m\", \"30s\". No default: opt-in.",
+          "description": "Maximum time a oneshot may run before it's killed and the wave fails,\nand the same limit for this service's `build`. A long-running service's\nown process is not bound by it. e.g. \"5m\", \"30s\". No default: opt-in.",
           "type": [
             "string",
             "null"
