@@ -1,6 +1,8 @@
 # Service lifecycle
 
-Status: draft
+Status: implemented for `stop`, `start`, `restart` and `build`. `run` for
+oneshots, crash-restart policy, watch mode and `--cascade` are not built.
+Where the implementation departed from this document, the section says so.
 
 ## Problem
 
@@ -39,13 +41,25 @@ Each service instance moves through:
 
 `Building` is skipped for services with no build step. `Running` keeps the
 existing readiness split: a service is running and pending between start
-and its probe passing. `Failed` covers a build failure, a start failure, or
-a probe that never passed. Today `status` is a free-form string in
+and its probe passing. Today `status` is a free-form string in
 `ServiceSnapshot` and only moves forward; it becomes this enum.
 
-Lifecycle mutations for a given service are serialized through the kernel.
-Two clients issuing `restart api` and `down` concurrently must not race two
-starts or interleave a start with a teardown.
+As built, there is no `Failed` state. A build that fails, a spawn that
+fails and a probe that gives up are the command's answer to its client,
+and the row keeps saying what is true: still running, or still stopped.
+A state that outlives the command that produced it would need a rule for
+when it clears, and nothing needs one yet. The states are `Starting`,
+`Running`, `Stopping`, `Stopped`, `Building` and `Exited`, the last
+carrying the runtime's wording for how a service ended. `Building` shows
+only for a service that is not running, since one that is stays running
+while it builds.
+
+Lifecycle mutations for a given service are serialized through the kernel:
+it handles one message at a time, and a command for a service that already
+has one in flight is refused rather than queued. Two clients issuing
+`restart api` and `down` concurrently do not race two starts or interleave
+a start with a teardown; `down` wins, abandoning a readiness probe and
+waiting out a stop that is already under way.
 
 ## Desired state vs actual state
 
@@ -86,7 +100,9 @@ take a working service down.
 Stopping `db` while `api` depends on it touches only `db` by default. The
 developer knows what they are doing, and this matches the dev-loop intent.
 `ps` marks dependents of a stopped or restarting service so the state is
-visible rather than silent.
+visible rather than silent. That marking is computed by the client from
+the rows it was sent: each row carries its direct dependencies, so the
+tracker stays derived from the bus and needs no access to the config.
 
 A `--cascade` flag extends the operation downstream: `stop --cascade db`
 stops the dependency closure in reverse wave order, `restart --cascade db`
@@ -99,9 +115,15 @@ The dev loop is not only code edits; it is often an edited env var or
 command in arig.yaml. A targeted restart re-reads that service's definition
 from the config file, so a restart after editing the yaml picks up the
 change. Silently restarting with the stale definition from `up` time is a
-trap. Structural edits (changed `depends_on`, added or removed services)
-are out of scope for restart and are reported as an error telling the user
-to bounce the stack.
+trap. Structural edits (changed `depends_on` or `type`, a service that is
+gone from the file) are out of scope for restart and are reported as an
+error telling the user to bounce the stack.
+
+Re-reading, validating and resolving the readiness probe all happen when
+the command is accepted, before the running instance is touched, so a
+config that no longer parses or a definition the runtime rejects fails the
+command with the old instance still up. A changed `runtime:` is adopted
+like any other field.
 
 ## Blocking semantics
 
@@ -127,9 +149,16 @@ unknown op); these verbs ride on whatever fix that issue gets, degrading to
 "supervisor too old for this command, restart the stack with the new
 binary".
 
-`ServiceSnapshot` grows desired state, a restart counter, and uptime. Log
-sinks reattach across restarts; a generation id on the service instance
-distinguishes output from consecutive runs.
+Since #40 is still open, the client recognises the parse error a supervisor
+too old for a verb answers with and rewords it. Whatever #40 settles on
+replaces that.
+
+`ServiceSnapshot` grows desired state, a restart counter, and uptime, all
+defaulted so an old CLI and an old supervisor stay mutually parseable. Log
+sinks reattach across restarts. There is no separate generation id: the
+restart counter is what distinguishes consecutive runs, and log lines are
+not tagged with it, so a sink cannot yet tell one run's output from the
+next.
 
 ## Pluggability
 
@@ -142,7 +171,9 @@ observation of transitions:
   already do (`Runtime::spawn`, `RunningService::begin_stop`/`finish_stop`);
   build joins them as a Runtime method whose default runs `build:` on the
   host shell, so a runtime can later substitute a native build (a docker
-  image build) without kernel changes.
+  image build) without kernel changes. It returns what to run rather than
+  running it, so the kernel keeps the log plumbing and the timeout in one
+  place and a runtime that overrides it inherits both.
 * Transitions are bus events, and the bus is the observation surface. Log
   sinks consume it today; `arig mcp` and external plugins subscribe to the
   same stream. Plugins observe state and request transitions; they never own
@@ -162,11 +193,15 @@ observation of transitions:
 
 ## Sequencing
 
-1. Per-service state machine and desired state in the tracker.
-2. `stop`, `start`, `restart` over IPC, blocking until ready.
-3. `build:` config key, `arig build`, `restart --build`.
+1. Per-service state machine and desired state in the tracker. Done.
+2. `stop`, `start`, `restart` over IPC, blocking until ready. Done.
+3. `build:` config key, `arig build`, `restart --build`. Done.
 4. `run` for oneshots.
 5. Crash policy, watch mode, partial up as separate efforts.
+
+An unexpected exit still takes the whole stack down, as it did before any
+of this. Telling a crash apart from a deliberate stop is what desired state
+is for, and the policy that would act on the difference is step 5.
 
 Step 1 builds on the microkernel architecture delivered under issue #29:
 the event bus and the `RunningService` stop seam are the primitives these
