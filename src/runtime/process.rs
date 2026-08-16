@@ -166,6 +166,12 @@ impl RunningService for ProcessChild {
     }
 
     async fn kill(&mut self) {
+        // The command runs under a shell that may have forked rather than
+        // exec'd, so killing the pid alone leaves the actual work running as
+        // an orphan. The child leads its own process group; kill that.
+        if let Some(pid) = self.child.id() {
+            kill_process_group(pid);
+        }
         // tokio's kill reaps the child as well as signalling it.
         let _ = self.child.kill().await;
     }
@@ -233,8 +239,9 @@ fn send_shutdown_signal(child: &tokio::process::Child) {
     unix::send_sigterm(pid);
 }
 
-/// Kill a helper process (a shutdown hook) and everything it started. On
-/// Windows the job object already owns the tree, so this is a no-op there.
+/// Kill a process group: a shutdown hook and whatever it started, or a
+/// service whose shell forked. On Windows the job object already owns the
+/// tree, so this is a no-op there.
 fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     unix::send_sigkill(pid);
@@ -338,6 +345,7 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     fn svc(command: &str, service_type: ServiceType) -> ServiceConfig {
         ServiceConfig {
@@ -373,6 +381,47 @@ mod tests {
     // because the pager waits on the console even when stdin is redirected.
     fn stdin_reader() -> &'static str {
         if cfg!(windows) { "set /p X=" } else { "cat" }
+    }
+
+    /// A oneshot that overruns its timeout, and a build cut short by a
+    /// shutdown, both end here. Killing the shell alone leaves whatever it
+    /// forked running with nothing to reap it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_a_service_takes_the_rest_of_its_process_group() {
+        // A trap keeps the shell around to handle it, so it forks its command
+        // rather than exec'ing it, and the fork joins the shell's group. The
+        // line the fork prints is how the test knows it exists: killing
+        // before it does would prove nothing.
+        let mut spawned = ProcessRuntime::new(Bus::new(1))
+            .spawn(
+                "api",
+                &svc(
+                    "trap '' TERM; sh -c 'echo forked; sleep 300'",
+                    ServiceType::Service,
+                ),
+            )
+            .await
+            .expect("spawn");
+        let pid = spawned.handle.pid().expect("a host process has a pid") as i32;
+
+        let mut lines =
+            tokio::io::BufReader::new(spawned.stdout.take().expect("stdout is piped")).lines();
+        tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("the fork must announce itself")
+            .expect("read stdout");
+
+        spawned.handle.kill().await;
+
+        // Signal 0 reports whether anything is left in the group.
+        for _ in 0..200 {
+            if unsafe { libc::kill(-pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the process group outlived the service");
     }
 
     #[tokio::test]
