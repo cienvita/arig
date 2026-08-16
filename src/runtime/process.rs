@@ -345,7 +345,6 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncBufReadExt;
 
     fn svc(command: &str, service_type: ServiceType) -> ServiceConfig {
         ServiceConfig {
@@ -389,6 +388,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn killing_a_service_takes_the_rest_of_its_process_group() {
+        // Scoped to the test: the whole test is unix-only, and an import at
+        // module level would be unused on Windows.
+        use tokio::io::AsyncBufReadExt;
+
         // A trap keeps the shell around to handle it, so it forks its command
         // rather than exec'ing it, and the fork joins the shell's group. The
         // line the fork prints is how the test knows it exists: killing
