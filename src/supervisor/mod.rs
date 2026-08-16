@@ -1250,11 +1250,30 @@ pub async fn detach_and_exit(config_file: &Path, opts: &UpOptions) -> anyhow::Re
         }
     }
 
-    let child = platform::spawn_detached(&mut cmd)?;
+    let mut child = platform::spawn_detached(&mut cmd)?;
     let pid = child.id();
     eprintln!("arig: spawned supervisor (pid {pid})");
 
-    match ipc::wait_ready(&endpoint, Duration::from_secs(10)).await {
+    // Watch the child alongside the socket. A supervisor that fails its build
+    // stage binds, fails and unlinks the socket in well under the timeout, and
+    // waiting the full ten seconds to report that it never bound describes
+    // neither what happened nor where to look.
+    let ready = ipc::wait_ready(&endpoint, Duration::from_secs(10));
+    tokio::pin!(ready);
+    let outcome = loop {
+        tokio::select! {
+            result = &mut ready => break result,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    break Err(anyhow::anyhow!(
+                        "supervisor exited ({status}) before it was ready"
+                    ));
+                }
+            }
+        }
+    };
+
+    match outcome {
         Ok(()) => {
             eprintln!("arig: supervisor ready at {}", endpoint.address);
             eprintln!("arig: log at {}", log_path.display());
