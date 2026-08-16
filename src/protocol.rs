@@ -14,6 +14,29 @@ pub enum Request {
     Wait,
     /// Trigger supervisor shutdown.
     Down,
+    /// Stop one service and leave the rest alone. The supervisor holds the
+    /// connection until the service is gone.
+    Stop { service: String },
+    /// Start one service that is not running. Held until its readiness probe
+    /// passes unless `no_wait` says otherwise.
+    Start {
+        service: String,
+        /// Defaulted so a flag added later still parses on both ends.
+        #[serde(default)]
+        no_wait: bool,
+    },
+    /// Stop and start one service, in one command.
+    Restart {
+        service: String,
+        /// Run the service's build first, and leave the running instance
+        /// alone if it fails.
+        #[serde(default)]
+        build: bool,
+        #[serde(default)]
+        no_wait: bool,
+    },
+    /// Run one service's build, without touching what is running.
+    Build { service: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,10 +84,31 @@ pub struct ServiceSnapshot {
     pub status: String,
     /// Defaulted rather than required: a detached supervisor outlives an
     /// upgrade, so a newer `arig ps` has to read a response from an older
-    /// supervisor that has no readiness to report.
+    /// supervisor that has no readiness to report. Everything below is
+    /// defaulted for the same reason.
     #[serde(default)]
     pub ready: Readiness,
+    /// What the operator asked for: "up" or "stopped". Absent from a
+    /// supervisor that has no notion of it.
+    #[serde(default)]
+    pub desired: Option<String>,
+    /// How many times this service has been started again since the stack
+    /// came up.
+    #[serde(default)]
+    pub restarts: u64,
+    /// How long the current instance has been running. Absent for a service
+    /// that is not running, and from a supervisor too old to report it.
+    #[serde(default)]
+    pub uptime_secs: Option<u64>,
+    /// The service's direct dependencies, so `ps` can mark a row whose
+    /// dependency is no longer running.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
+
+/// The `status` a service in ordinary operation reports. Both ends need it:
+/// the supervisor writes it, and `ps` marks dependencies that are not it.
+pub const RUNNING: &str = "running";
 
 /// Where a service is against its readiness probe. Separate from `status`,
 /// which reports the process: a service can be running and not yet ready.
@@ -119,6 +163,38 @@ mod tests {
         let resp: Response = serde_json::from_str(older).expect("an older response must parse");
         let services = resp.services.expect("the response carries services");
         assert_eq!(services[0].ready, Readiness::Unchecked);
+        assert_eq!(services[0].restarts, 0);
+        assert_eq!(services[0].uptime_secs, None);
+        assert!(services[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn a_lifecycle_request_names_its_service_on_the_wire() {
+        let json = serde_json::to_string(&Request::Restart {
+            service: "api".to_string(),
+            build: true,
+            no_wait: false,
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            json,
+            r#"{"op":"restart","service":"api","build":true,"no_wait":false}"#
+        );
+    }
+
+    /// The flags are defaulted so that a client sending only what it knows
+    /// about still parses, whichever end is newer.
+    #[test]
+    fn a_lifecycle_request_without_flags_parses() {
+        let req: Request =
+            serde_json::from_str(r#"{"op":"start","service":"api"}"#).expect("parse");
+
+        let Request::Start { service, no_wait } = req else {
+            panic!("expected a start request, got {req:?}");
+        };
+        assert_eq!(service, "api");
+        assert!(!no_wait);
     }
 
     #[test]

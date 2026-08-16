@@ -7,7 +7,7 @@
 pub mod docker;
 pub mod process;
 
-use crate::config::ServiceConfig;
+use crate::config::{ServiceConfig, ServiceType};
 use async_trait::async_trait;
 use std::fmt;
 use std::process::ExitStatus;
@@ -84,6 +84,29 @@ pub trait Runtime: Send + Sync {
     }
 
     async fn spawn(&self, name: &str, spec: &ServiceConfig) -> anyhow::Result<SpawnedService>;
+
+    /// How this runtime rebuilds a service, as something the kernel runs the
+    /// way it runs a oneshot. `None` means the service has no build step.
+    ///
+    /// The default is the service's `build:` line on the host shell, whatever
+    /// the runtime, so a runtime that has a build of its own (a docker image)
+    /// overrides this rather than the kernel learning about runtimes.
+    fn build(&self, spec: &ServiceConfig) -> Option<ServiceConfig> {
+        spec.build.as_ref().map(|command| ServiceConfig {
+            runtime: process::NAME.to_string(),
+            command: Some(command.clone()),
+            build: None,
+            image: None,
+            ports: Vec::new(),
+            service_type: ServiceType::Oneshot,
+            working_dir: spec.working_dir.clone(),
+            env: spec.env.clone(),
+            depends_on: Vec::new(),
+            ready: None,
+            timeout: spec.timeout,
+            shutdown: None,
+        })
+    }
 }
 
 #[async_trait]

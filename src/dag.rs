@@ -79,6 +79,7 @@ mod tests {
         ServiceConfig {
             runtime: crate::registry::DEFAULT_RUNTIME.to_string(),
             command: Some(command.to_string()),
+            build: None,
             image: None,
             ports: Vec::new(),
             service_type: Default::default(),

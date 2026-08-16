@@ -404,6 +404,7 @@ mod tests {
         ServiceConfig {
             runtime: NAME.to_string(),
             command: None,
+            build: None,
             image: image.map(str::to_string),
             ports: ports.iter().map(|p| p.to_string()).collect(),
             service_type: ServiceType::Service,

@@ -51,6 +51,48 @@ enum Commands {
         #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
         timeout: std::time::Duration,
     },
+    /// Stop one service and leave the rest running
+    Stop {
+        /// Service to stop
+        service: String,
+        /// Give up waiting for it to stop after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
+    /// Start one service that is not running
+    Start {
+        /// Service to start
+        service: String,
+        /// Return once it has spawned, without waiting for its readiness probe
+        #[arg(long)]
+        no_wait: bool,
+        /// Give up waiting for it to be ready after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
+    /// Stop and start one service
+    Restart {
+        /// Service to restart
+        service: String,
+        /// Run the service's build first; a build that fails leaves the
+        /// running instance alone
+        #[arg(long)]
+        build: bool,
+        /// Return once it has spawned, without waiting for its readiness probe
+        #[arg(long)]
+        no_wait: bool,
+        /// Give up waiting for it to be ready after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
+    /// Run one service's build, leaving what is running alone
+    Build {
+        /// Service to build
+        service: String,
+        /// Give up waiting for the build after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
+        timeout: std::time::Duration,
+    },
     /// Print the JSON schema for arig.yaml to stdout
     Schema,
     /// Internal: act as a workspace supervisor. Spawned by `arig up --detach`.
@@ -82,14 +124,14 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_current_dir(&workspace)
                 .map_err(|e| anyhow::anyhow!("failed to chdir to {}: {e}", workspace.display()))?;
             let config = config::ArigConfig::load(&cli.file)?;
-            supervisor::up(config, true).await
+            supervisor::up(config, Some(cli.file), true).await
         }
         Commands::Up { detach } => {
             let config = config::ArigConfig::load(&cli.file)?;
             if detach {
                 supervisor::detach_and_exit(&cli.file).await
             } else {
-                supervisor::up(config, false).await
+                supervisor::up(config, Some(cli.file), false).await
             }
         }
         Commands::Down => {
@@ -103,6 +145,31 @@ async fn main() -> anyhow::Result<()> {
         Commands::Wait { timeout } => {
             let cwd = std::env::current_dir()?;
             client::wait(&cwd, timeout).await
+        }
+        Commands::Stop { service, timeout } => {
+            let cwd = std::env::current_dir()?;
+            client::stop(&cwd, &service, timeout).await
+        }
+        Commands::Start {
+            service,
+            no_wait,
+            timeout,
+        } => {
+            let cwd = std::env::current_dir()?;
+            client::start(&cwd, &service, no_wait, timeout).await
+        }
+        Commands::Restart {
+            service,
+            build,
+            no_wait,
+            timeout,
+        } => {
+            let cwd = std::env::current_dir()?;
+            client::restart(&cwd, &service, build, no_wait, timeout).await
+        }
+        Commands::Build { service, timeout } => {
+            let cwd = std::env::current_dir()?;
+            client::build(&cwd, &service, timeout).await
         }
     }
 }

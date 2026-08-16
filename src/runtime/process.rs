@@ -166,13 +166,23 @@ impl RunningService for ProcessChild {
     }
 
     async fn kill(&mut self) {
+        // The command runs under a shell that may have forked rather than
+        // exec'd, so killing the pid alone leaves the actual work running as
+        // an orphan. The child leads its own process group; kill that.
+        if let Some(pid) = self.child.id() {
+            kill_process_group(pid);
+        }
         // tokio's kill reaps the child as well as signalling it.
         let _ = self.child.kill().await;
     }
 }
 
 impl ProcessChild {
-    /// Wait out `grace` and kill whatever is left.
+    /// Wait out `grace` and kill whatever is left. This is where a service
+    /// that ignores the shutdown signal ends up, and an ignored disposition is
+    /// inherited across fork and exec, so the shell's children are as likely
+    /// to still be there as the shell: kill through the same path `kill` takes
+    /// rather than reaching for the pid.
     async fn wait_or_kill(&mut self, grace: Duration) -> StopOutcome {
         match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(Ok(status)) => StopOutcome::Exited(status.into()),
@@ -182,7 +192,7 @@ impl ProcessChild {
                     "arig: {} did not stop in time, force killing",
                     self.name
                 );
-                let _ = self.child.kill().await;
+                self.kill().await;
                 StopOutcome::Killed
             }
         }
@@ -233,8 +243,9 @@ fn send_shutdown_signal(child: &tokio::process::Child) {
     unix::send_sigterm(pid);
 }
 
-/// Kill a helper process (a shutdown hook) and everything it started. On
-/// Windows the job object already owns the tree, so this is a no-op there.
+/// Kill a process group: a shutdown hook and whatever it started, or a
+/// service whose shell forked. On Windows the job object already owns the
+/// tree, so this is a no-op there.
 fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     unix::send_sigkill(pid);
@@ -343,6 +354,7 @@ mod tests {
         ServiceConfig {
             runtime: NAME.to_string(),
             command: Some(command.to_string()),
+            build: None,
             image: None,
             ports: Vec::new(),
             service_type,
@@ -372,6 +384,84 @@ mod tests {
     // because the pager waits on the console even when stdin is redirected.
     fn stdin_reader() -> &'static str {
         if cfg!(windows) { "set /p X=" } else { "cat" }
+    }
+
+    /// A service whose shell forks its command and ignores the shutdown
+    /// signal, which an ignored disposition passes on to the fork. Returns it
+    /// once the fork has announced itself: acting before it exists would prove
+    /// nothing.
+    #[cfg(unix)]
+    async fn forked_service() -> (SpawnedService, i32) {
+        // Scoped to the fixture: everything using it is unix-only, and an
+        // import at module level would be unused on Windows.
+        use tokio::io::AsyncBufReadExt;
+
+        let mut spawned = ProcessRuntime::new(Bus::new(1))
+            .spawn(
+                "api",
+                &svc(
+                    "trap '' TERM; sh -c 'echo forked; sleep 300'",
+                    ServiceType::Service,
+                ),
+            )
+            .await
+            .expect("spawn");
+        let pid = spawned.handle.pid().expect("a host process has a pid") as i32;
+
+        let mut lines =
+            tokio::io::BufReader::new(spawned.stdout.take().expect("stdout is piped")).lines();
+        tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("the fork must announce itself")
+            .expect("read stdout");
+
+        (spawned, pid)
+    }
+
+    /// Whether anything is left in the group led by `pid`. Signal 0 asks
+    /// without sending anything.
+    #[cfg(unix)]
+    async fn group_gone(pid: i32) -> bool {
+        for _ in 0..200 {
+            if unsafe { libc::kill(-pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A oneshot that overruns its timeout, and a build cut short by a
+    /// shutdown, both end here. Killing the shell alone leaves whatever it
+    /// forked running with nothing to reap it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_a_service_takes_the_rest_of_its_process_group() {
+        let (mut spawned, pid) = forked_service().await;
+
+        spawned.handle.kill().await;
+
+        assert!(
+            group_gone(pid).await,
+            "the process group outlived the service"
+        );
+    }
+
+    /// The path an ordinary `arig stop` takes. The signal is ignored here, so
+    /// the stop runs out its grace period and force-kills, which is the case
+    /// that used to leave the forked work behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_service_that_ignores_the_signal_takes_its_group_too() {
+        let (mut spawned, pid) = forked_service().await;
+
+        spawned.handle.begin_stop();
+        match spawned.handle.finish_stop().await {
+            StopOutcome::Killed => {}
+            StopOutcome::Exited(status) => panic!("the trap must outlast the signal, got {status}"),
+        }
+
+        assert!(group_gone(pid).await, "the process group outlived the stop");
     }
 
     #[tokio::test]

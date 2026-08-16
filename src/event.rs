@@ -58,9 +58,39 @@ pub enum Event {
         /// Whether a readiness probe gates this service. Started is not ready
         /// when one does, and subscribers have no other way to tell.
         probed: bool,
+        /// The service's direct dependencies. Carried here so the tracker can
+        /// relate rows to each other without reaching for the config.
+        depends_on: Vec<String>,
     },
     /// A service's readiness probe passed.
     ServiceReady {
+        name: String,
+    },
+    /// A service was asked to start again after being stopped. Carried
+    /// separately from ServiceStarted, which only follows once it has spawned:
+    /// a runtime that has an image to pull first can sit here for a while.
+    StartRequested {
+        name: String,
+    },
+    /// A service was asked to stop on its own. What makes the exit that
+    /// follows deliberate rather than a service dying.
+    StopRequested {
+        name: String,
+    },
+    /// A service the supervisor stopped on purpose is gone.
+    ServiceStopped {
+        name: String,
+    },
+    /// A service's build has started. Builds run against a service that is
+    /// still up as readily as against a stopped one, which is the point:
+    /// build first, stop second.
+    BuildStarted {
+        name: String,
+    },
+    /// A service's build has ended. Whether it worked is the command's answer
+    /// to its client and a line in the log; the state machine only needs to
+    /// know the build is over.
+    BuildFinished {
         name: String,
     },
     OneshotCompleted {

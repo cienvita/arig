@@ -54,7 +54,7 @@ pub enum ServiceType {
     Oneshot,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ServiceConfig {
     /// Which runtime runs this service. `process` runs it via the system
     /// shell; `docker` runs it as a container.
@@ -63,6 +63,10 @@ pub struct ServiceConfig {
     /// Command line to execute. Required by the `process` runtime. On
     /// `docker` it overrides the image's command, and may be omitted.
     pub command: Option<String>,
+    /// Command that rebuilds this service; run by `arig build` and
+    /// `arig restart --build`. Runs on the host through the system shell, in
+    /// working_dir with env, whatever the runtime.
+    pub build: Option<String>,
     /// Container image. Required by the `docker` runtime, ignored otherwise.
     pub image: Option<String>,
     /// Ports to publish, as "host:container" or a bare port for both.
@@ -81,8 +85,9 @@ pub struct ServiceConfig {
     pub depends_on: Vec<String>,
     /// Optional readiness probe. Dependents wait until this passes.
     pub ready: Option<ReadyProbe>,
-    /// Maximum time a oneshot may run before it's killed and the wave fails.
-    /// Ignored for long-running services. e.g. "5m", "30s". No default: opt-in.
+    /// Maximum time a oneshot may run before it's killed and the wave fails,
+    /// and the same limit for this service's `build`. A long-running service's
+    /// own process is not bound by it. e.g. "5m", "30s". No default: opt-in.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
@@ -93,7 +98,7 @@ pub struct ServiceConfig {
 }
 
 /// Shutdown hook configuration for a service.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShutdownConfig {
     /// Command to run to stop the service.
     pub command: String,
