@@ -393,7 +393,7 @@ impl Kernel {
     /// service's build consumes another's output, and a library that is not a
     /// service of its own does not appear in it at all. Ordering builds by it
     /// would be wrong in both directions, so arig does not pretend to know.
-    async fn build_all(&self) -> anyhow::Result<Builds> {
+    async fn build_all(&self, waves: &[Vec<String>]) -> anyhow::Result<Builds> {
         if self.no_build {
             return Ok(Builds::Done);
         }
@@ -423,8 +423,23 @@ impl Kernel {
         let builds = planned.into_iter().map(|(name, runner, plan)| {
             let bus = self.bus.clone();
             let shutdown = self.shutdown_rx.clone();
+            // The event seeds the `ps` row for this stage, so it carries what
+            // the row needs: nothing has started, and there is nothing else
+            // to derive a row from.
+            let spec = &self.config.services[&name];
+            let wave = waves
+                .iter()
+                .position(|wave| wave.contains(&name))
+                .unwrap_or(0);
+            let kind = ServiceKind::from(&spec.service_type);
+            let depends_on = spec.depends_on.clone();
             async move {
-                bus.emit(Event::BuildStarted { name: name.clone() });
+                bus.emit(Event::BuildStarted {
+                    name: name.clone(),
+                    wave,
+                    kind,
+                    depends_on,
+                });
                 event!(bus, "arig: building '{name}'");
                 let result = run_build(&bus, runner.as_ref(), &name, &plan, shutdown).await;
                 bus.emit(Event::BuildFinished { name });
@@ -513,7 +528,7 @@ impl Kernel {
         // Last thing before anything spawns, and after everything that can be
         // rejected on inspection has been: a config arig was never going to
         // accept should not cost a build first.
-        match self.build_all().await? {
+        match self.build_all(&waves).await? {
             Builds::Interrupted => {
                 // The same clean stop the waves report, minus the tear-down
                 // they have to do: the whole point of building up front is
@@ -1072,8 +1087,12 @@ impl Kernel {
             }
         };
 
+        let spec = &self.config.services[name];
         self.bus.emit(Event::BuildStarted {
             name: name.to_string(),
+            wave: steady.wave_of.get(name).copied().unwrap_or(0),
+            kind: ServiceKind::from(&spec.service_type),
+            depends_on: spec.depends_on.clone(),
         });
         event!(self.bus, "arig: building '{name}'");
 
