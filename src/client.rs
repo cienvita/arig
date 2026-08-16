@@ -86,7 +86,7 @@ pub async fn start(
         service: service.to_string(),
         no_wait,
     };
-    lifecycle(workspace, req, timeout, "start", &started(service, no_wait)).await
+    lifecycle(workspace, req, timeout, "start", &started(service)).await
 }
 
 pub async fn restart(
@@ -106,7 +106,7 @@ pub async fn restart(
         req,
         timeout,
         "restart",
-        &started(service, no_wait),
+        &format!("'{service}' restarted"),
     )
     .await
 }
@@ -125,14 +125,12 @@ pub async fn build(workspace: &Path, service: &str, timeout: Duration) -> Result
     .await
 }
 
-/// What a start got as far as. Without a probe there is nothing to be ready
-/// for, so the claim is only that it started.
-fn started(service: &str, no_wait: bool) -> String {
-    if no_wait {
-        format!("'{service}' started")
-    } else {
-        format!("'{service}' started and ready")
-    }
+/// What a start got as far as. The supervisor reports success either way and
+/// does not say whether a probe was involved, so the client cannot claim the
+/// service is ready: a service with no `ready:` block never was checked. What
+/// the exit code means is in the README.
+fn started(service: &str) -> String {
+    format!("'{service}' started")
 }
 
 /// Send a lifecycle command and report what the supervisor made of it. The
@@ -201,24 +199,25 @@ pub async fn ps(workspace: &Path) -> Result<()> {
 }
 
 fn print_ps(services: &[ServiceSnapshot]) {
-    let name_w = services
-        .iter()
-        .map(|s| s.name.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let kind_w = services
-        .iter()
-        .map(|s| s.kind.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let status_w = services
-        .iter()
-        .map(|s| s.status.len())
-        .max()
-        .unwrap_or(6)
-        .max(6);
+    for line in render_ps(services) {
+        println!("{line}");
+    }
+}
+
+/// The `ps` table, header first. Every column is as wide as the widest thing
+/// in it, header included, since a value wider than its header would push
+/// everything after it out of line.
+fn render_ps(services: &[ServiceSnapshot]) -> Vec<String> {
+    let width = |header: &str, values: &mut dyn Iterator<Item = usize>| {
+        values.max().unwrap_or(0).max(header.len())
+    };
+    let name_w = width("NAME", &mut services.iter().map(|s| s.name.len()));
+    let kind_w = width("KIND", &mut services.iter().map(|s| s.kind.len()));
+    let status_w = width("STATUS", &mut services.iter().map(|s| s.status.len()));
+    let ready_w = width(
+        "READY",
+        &mut services.iter().map(|s| s.ready.as_str().len()),
+    );
 
     // A supervisor from before these existed reports none of them, and its
     // table is printed the way it always was rather than with empty columns.
@@ -229,17 +228,27 @@ fn print_ps(services: &[ServiceSnapshot]) {
     let show_restarts = services.iter().any(|s| s.restarts > 0);
     let show_uptime = services.iter().any(|s| s.uptime_secs.is_some());
     let show_note = notes.iter().any(|n| !n.is_empty());
-    let uptime_w = uptimes.iter().map(String::len).max().unwrap_or(6).max(6);
+    let desired_w = width(
+        "DESIRED",
+        &mut services
+            .iter()
+            .map(|s| s.desired.as_deref().unwrap_or("-").len()),
+    );
+    let restarts_w = width(
+        "RESTARTS",
+        &mut services.iter().map(|s| s.restarts.to_string().len()),
+    );
+    let uptime_w = width("UPTIME", &mut uptimes.iter().map(String::len));
 
     let mut header = format!(
-        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {:<5}",
+        "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {:<ready_w$}",
         "NAME", "WAVE", "PID", "KIND", "STATUS", "READY",
     );
     if show_desired {
-        header.push_str("  DESIRED");
+        header.push_str(&format!("  {:<desired_w$}", "DESIRED"));
     }
     if show_restarts {
-        header.push_str("  RESTARTS");
+        header.push_str(&format!("  {:>restarts_w$}", "RESTARTS"));
     }
     if show_uptime {
         header.push_str(&format!("  {:>uptime_w$}", "UPTIME"));
@@ -247,15 +256,15 @@ fn print_ps(services: &[ServiceSnapshot]) {
     if show_note {
         header.push_str("  NOTE");
     }
-    println!("{}", header.trim_end());
 
+    let mut table = vec![header.trim_end().to_string()];
     for (i, s) in services.iter().enumerate() {
         let pid = match s.pid {
             Some(pid) => pid.to_string(),
             None => "-".to_string(),
         };
         let mut row = format!(
-            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {:<5}",
+            "{:<name_w$}  {:>4}  {:>7}  {:<kind_w$}  {:<status_w$}  {:<ready_w$}",
             s.name,
             s.wave,
             pid,
@@ -264,10 +273,13 @@ fn print_ps(services: &[ServiceSnapshot]) {
             s.ready.as_str(),
         );
         if show_desired {
-            row.push_str(&format!("  {:<7}", s.desired.as_deref().unwrap_or("-")));
+            row.push_str(&format!(
+                "  {:<desired_w$}",
+                s.desired.as_deref().unwrap_or("-")
+            ));
         }
         if show_restarts {
-            row.push_str(&format!("  {:>8}", s.restarts));
+            row.push_str(&format!("  {:>restarts_w$}", s.restarts));
         }
         if show_uptime {
             row.push_str(&format!("  {:>uptime_w$}", uptimes[i]));
@@ -275,8 +287,9 @@ fn print_ps(services: &[ServiceSnapshot]) {
         if show_note {
             row.push_str(&format!("  {}", notes[i]));
         }
-        println!("{}", row.trim_end());
+        table.push(row.trim_end().to_string());
     }
+    table
 }
 
 fn uptime(service: &ServiceSnapshot) -> String {
@@ -319,6 +332,26 @@ mod tests {
             uptime_secs: None,
             depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
         }
+    }
+
+    /// `pending` is wider than the `READY` heading, and every column after it
+    /// used to be pushed out of line on the row that carried it.
+    #[test]
+    fn a_value_wider_than_its_heading_keeps_the_table_aligned() {
+        let mut waiting = row("api", "running", &[]);
+        waiting.ready = Readiness::Pending;
+        waiting.restarts = 3;
+        waiting.uptime_secs = Some(90);
+        let rows = [row("db", "running", &[]), waiting];
+
+        assert_eq!(
+            render_ps(&rows).join("\n"),
+            concat!(
+                "NAME  WAVE      PID  KIND     STATUS   READY    DESIRED  RESTARTS  UPTIME\n",
+                "db       0        1  service  running  -        up              0       -\n",
+                "api      0        1  service  running  pending  up              3  1m 30s",
+            )
+        );
     }
 
     #[test]
