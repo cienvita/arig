@@ -225,6 +225,8 @@ fn print_ps(services: &[ServiceSnapshot]) {
     let uptimes: Vec<String> = services.iter().map(uptime).collect();
     let notes: Vec<String> = services.iter().map(|s| note(s, services)).collect();
     let show_desired = services.iter().any(|s| s.desired.is_some());
+    // Only worth a column once something has actually been restarted.
+    let show_restarts = services.iter().any(|s| s.restarts > 0);
     let show_uptime = services.iter().any(|s| s.uptime_secs.is_some());
     let show_note = notes.iter().any(|n| !n.is_empty());
     let uptime_w = uptimes.iter().map(String::len).max().unwrap_or(6).max(6);
@@ -235,6 +237,9 @@ fn print_ps(services: &[ServiceSnapshot]) {
     );
     if show_desired {
         header.push_str("  DESIRED");
+    }
+    if show_restarts {
+        header.push_str("  RESTARTS");
     }
     if show_uptime {
         header.push_str(&format!("  {:>uptime_w$}", "UPTIME"));
@@ -260,6 +265,9 @@ fn print_ps(services: &[ServiceSnapshot]) {
         );
         if show_desired {
             row.push_str(&format!("  {:<7}", s.desired.as_deref().unwrap_or("-")));
+        }
+        if show_restarts {
+            row.push_str(&format!("  {:>8}", s.restarts));
         }
         if show_uptime {
             row.push_str(&format!("  {:>uptime_w$}", uptimes[i]));
