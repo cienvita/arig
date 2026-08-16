@@ -53,10 +53,8 @@ enum Commands {
     Ps,
     /// Block until every service has started and every readiness probe passed
     Wait {
-        /// Give up after this long, e.g. "30s", "5m". Startup includes the
-        /// build stage, so the default covers `up --build-timeout` as well as
-        /// the time the services take to become ready.
-        #[arg(long, default_value = "12m", value_parser = humantime::parse_duration)]
+        /// Give up after this long, e.g. "30s", "5m"
+        #[arg(long, default_value = "2m", value_parser = humantime::parse_duration)]
         timeout: std::time::Duration,
     },
     /// Stop one service and leave the rest running

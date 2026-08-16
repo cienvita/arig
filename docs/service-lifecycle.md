@@ -118,8 +118,15 @@ graph would need declaring separately, and nothing yet needs one.
 
 `up --build-timeout` bounds the stage as a whole. A service's `timeout:` is
 opt-in and bounds only its own build, so without a ceiling on the stage a
-build that never ends holds startup open indefinitely. The stage counts
-against `arig wait`, which is why that timeout's default accommodates it.
+build that never ends holds startup open indefinitely.
+
+A detaching `up` holds for the stage rather than returning at socket bind, so
+the terminal that asked for the stack is the one that hears about a broken
+build. Returning earlier made that a race: a build that failed inside the
+parent's probe window read as a supervisor that died, and one that failed
+after it read as success, leaving the failure for whoever ran `arig wait`
+later. Holding also keeps `wait` about readiness, which is what its timeout
+is sized for.
 
 ## Dependents
 

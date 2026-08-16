@@ -61,10 +61,10 @@ in the supervisor log, rather than surfacing only to whoever runs
 `arig wait` blocks until every wave is up and every readiness probe has
 passed, then exits 0. It exits non-zero, reporting why, if a build fails, a
 probe never passes, a oneshot fails, a service exits while the stack is still
-coming up, or the timeout (`--timeout`, default 12m) elapses first. That
-default covers the build stage as well as the services becoming ready, which
-is why it is not tighter; the precise failures come from the supervisor
-rather than from it.
+coming up, or the timeout (`--timeout`, default 2m) elapses first. `up -d`
+has already held for the build stage by the time this runs, so the default is
+sized for readiness alone; a `wait` issued while a stack is still building
+covers that stage too, and needs a timeout to match.
 
 `arig ps` lists what the supervisor is tracking. `STATUS` reports the process,
 `READY` reports the probe: a service is `running` and `pending` between
